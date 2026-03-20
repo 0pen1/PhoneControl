@@ -1,4 +1,4 @@
-![截屏2026-03-20 14.17.22](./docs/img/截屏2026-03-20 14.17.22.png)
+![截屏2026-03-20 14.17.22](https://github.com/0pen1/PhoneControl/blob/main/docs/img/%E6%88%AA%E5%B1%8F2026-03-20%2014.17.22.png)
 
 # Phone Control
 
