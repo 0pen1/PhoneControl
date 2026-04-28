@@ -50,6 +50,8 @@ export function parseV3Frame(buf: ArrayBuffer): ParsedV3Frame {
 
 export function useStream() {
   const setStreamFrame = useStore((s) => s.setStreamFrame);
+  const clearStreamFrame = useStore((s) => s.clearStreamFrame);
+  const setStreamStatus = useStore((s) => s.setStreamStatus);
   const devices = useStore((s) => s.devices);
   const disabledSerials = useStore((s) => s.disabledSerials);
   const page = useStore((s) => s.page);
@@ -80,10 +82,11 @@ export function useStream() {
         if (state.decoder.state !== 'closed') {
           try { state.decoder.close(); } catch { /* noop */ }
         }
+        clearStreamFrame(serial);
         decodersRef.current.delete(serial);
       }
     }
-  }, [desired]);
+  }, [desired, clearStreamFrame]);
 
   useEffect(() => {
     let cancelled = false;
@@ -109,7 +112,12 @@ export function useStream() {
           if (!state.ctx) state.ctx = canvas.getContext('2d');
           if (state.ctx) state.ctx.drawImage(frame, 0, 0);
         }
-        if (state.lastWidth !== frame.displayWidth || state.lastHeight !== frame.displayHeight) {
+        const frameMissing = !useStore.getState().streamFrames[serial];
+        if (
+          frameMissing ||
+          state.lastWidth !== frame.displayWidth ||
+          state.lastHeight !== frame.displayHeight
+        ) {
           state.lastWidth = frame.displayWidth;
           state.lastHeight = frame.displayHeight;
           setStreamFrame(serial, frame.displayWidth, frame.displayHeight);
@@ -223,11 +231,15 @@ export function useStream() {
       }
     }
 
-    function cleanupDecoders() {
-      for (const [, state] of decoders) {
+    function cleanupDecoders(reason?: string) {
+      for (const [serial, state] of decoders) {
         if (state.pendingFrame) { state.pendingFrame.close(); state.pendingFrame = null; }
         if (state.decoder.state !== 'closed') {
           try { state.decoder.close(); } catch { /* noop */ }
+        }
+        clearStreamFrame(serial);
+        if (reason) {
+          setStreamStatus(serial, 'disconnected', reason);
         }
       }
       decoders.clear();
@@ -265,7 +277,7 @@ export function useStream() {
       ws.onclose = () => {
         if (wsRef.current === ws) wsRef.current = null;
         subscribedRef.current = new Set();
-        cleanupDecoders();
+        cleanupDecoders('local video socket disconnected');
         scheduleReconnect();
       };
 
@@ -299,7 +311,7 @@ export function useStream() {
       }
       cleanupDecoders();
     };
-  }, [setStreamFrame]);
+  }, [setStreamFrame, clearStreamFrame, setStreamStatus]);
 }
 
 export function reconcile(

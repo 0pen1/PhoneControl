@@ -43,7 +43,8 @@ mod tests {
 
     #[test]
     fn test_parse_devices_normal() {
-        let output = "List of devices attached\nemulator-5554\tdevice\n192.168.1.100:5555\tdevice\n";
+        let output =
+            "List of devices attached\nemulator-5554\tdevice\n192.168.1.100:5555\tdevice\n";
         let devices = parse_adb_devices(output);
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].0, "emulator-5554");

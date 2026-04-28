@@ -39,6 +39,11 @@
   color: var(--accent);
 }
 .keyBtn:disabled { opacity: 0.35; cursor: not-allowed; }
+.keyBtnWide {
+  width: 46px;
+  font-size: 12px;
+  font-weight: 700;
+}
 
 /* Mode toggle */
 .modeToggle {

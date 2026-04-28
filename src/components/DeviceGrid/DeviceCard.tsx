@@ -10,12 +10,14 @@ interface Props {
   device: Device;
   screenshot: string | undefined;
   selected: boolean;
+  streamOptions: { max_size: number; max_fps: number; bit_rate: number };
 }
 
-function DeviceCardInner({ device, screenshot, selected }: Props) {
+function DeviceCardInner({ device, screenshot, selected, streamOptions }: Props) {
   const toggleSelect = useStore((s) => s.toggleSelect);
   const toggleDisableDevice = useStore((s) => s.toggleDisableDevice);
-  const fps = useStore((s) => s.fps);
+  const groupInputBusy = useStore((s) => s.groupInputBusy);
+  const setGroupInputBusy = useStore((s) => s.setGroupInputBusy);
   const frame = useStore((s) => s.streamFrames[device.serial]);
   const status = useStore((s) => s.streamStatus[device.serial]);
   const cmds = useAdbCommands();
@@ -23,6 +25,7 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const imgElementRef = useRef<HTMLImageElement>(null);
   const [copied, setCopied] = useState(false);
+  const [tapMarker, setTapMarker] = useState<{ x: number; y: number } | null>(null);
 
   const isOnline = device.status === 'online';
 
@@ -39,18 +42,27 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
     const wasSelected = selected;
     toggleSelect(device.serial);
     if (!wasSelected) {
-      cmds.startStream(device.serial, device.server_host, device.server_port, { max_size: 720, max_fps: fps, bit_rate: 4_000_000 });
+      cmds.startStream(device.serial, device.server_host, device.server_port, streamOptions);
     } else {
       cmds.stopStream(device.serial);
     }
-  }, [device.serial, device.server_host, device.server_port, selected, isOnline, fps, cmds, toggleSelect]);
+  }, [device.serial, device.server_host, device.server_port, selected, isOnline, streamOptions, cmds, toggleSelect]);
 
   // Compute image-space coordinates from a mouse event on the screen div.
   // Works with both <canvas> (stream) and <img> (screenshot fallback).
-  const mapCoordinates = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const rect = e.currentTarget.getBoundingClientRect();
-    const containerX = e.clientX - rect.left;
-    const containerY = e.clientY - rect.top;
+  const showTapMarker = useCallback((x: number, y: number) => {
+    setTapMarker({ x, y });
+    window.setTimeout(() => setTapMarker(null), 650);
+  }, []);
+
+  const mapCoordinatesFromClient = useCallback((clientX: number, clientY: number) => {
+    const el = imgRef.current;
+    if (!el) {
+      return null;
+    }
+    const rect = el.getBoundingClientRect();
+    const containerX = clientX - rect.left;
+    const containerY = clientY - rect.top;
 
     let x = containerX;
     let y = containerY;
@@ -78,33 +90,44 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
       y = Math.max(0, Math.min(y, sourceHeight));
     }
 
-    return { x, y, sourceWidth: Math.round(sourceWidth), sourceHeight: Math.round(sourceHeight) };
+    return {
+      x,
+      y,
+      sourceWidth: Math.round(sourceWidth),
+      sourceHeight: Math.round(sourceHeight),
+      markerX: Math.max(0, Math.min(containerX, rect.width)),
+      markerY: Math.max(0, Math.min(containerY, rect.height)),
+    };
   }, []);
 
-  const swipeStart = useRef<{ x: number; y: number } | null>(null);
+  const mapCoordinates = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    return mapCoordinatesFromClient(e.clientX, e.clientY);
+  }, [mapCoordinatesFromClient]);
+
+  const swipeStart = useRef<{ clientX: number; clientY: number } | null>(null);
   const handleMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    if (!isOnline) return;
+    if (!isOnline || groupInputBusy) return;
     if (e.button !== 0) return;
     e.preventDefault();
     e.stopPropagation();
-    swipeStart.current = { x: e.clientX, y: e.clientY };
-  }, [isOnline]);
+    swipeStart.current = { clientX: e.clientX, clientY: e.clientY };
+  }, [isOnline, groupInputBusy]);
 
   const handleMouseUp = useCallback(
     async (e: React.MouseEvent<HTMLDivElement>) => {
-      if (!swipeStart.current || !isOnline) return;
+      if (!swipeStart.current || !isOnline || groupInputBusy) return;
       if (e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
 
-      const dx = e.clientX - swipeStart.current.x;
-      const dy = e.clientY - swipeStart.current.y;
+      const dx = e.clientX - swipeStart.current.clientX;
+      const dy = e.clientY - swipeStart.current.clientY;
       const dist = Math.sqrt(dx * dx + dy * dy);
 
       if (dist > 10) {
         const rect = e.currentTarget.getBoundingClientRect();
-        const containerX1 = swipeStart.current.x - rect.left;
-        const containerY1 = swipeStart.current.y - rect.top;
+        const containerX1 = swipeStart.current.clientX - rect.left;
+        const containerY1 = swipeStart.current.clientY - rect.top;
         const containerX2 = e.clientX - rect.left;
         const containerY2 = e.clientY - rect.top;
 
@@ -143,29 +166,54 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
         sourceHeight = Math.round(sourceHeight);
 
         try {
+          setGroupInputBusy(true);
           const results = selected
-            ? await cmds.swipeDevices(x1, y1, x2, y2, 300, sourceWidth, sourceHeight)
+            ? await cmds.swipeDevices(x1, y1, x2, y2, 300, sourceWidth, sourceHeight, device.serial)
             : await cmds.swipeDevice(device, x1, y1, x2, y2, 300, sourceWidth, sourceHeight);
           const failed = results.filter(r => !r.success);
           if (failed.length > 0) console.error('Swipe failed:', failed);
         } catch (err) {
           console.error('Swipe error:', err);
+        } finally {
+          setGroupInputBusy(false);
         }
       } else {
-        const { x, y, sourceWidth, sourceHeight } = mapCoordinates(e);
+        const mapped = mapCoordinatesFromClient(
+          swipeStart.current.clientX,
+          swipeStart.current.clientY
+        );
+        if (!mapped) {
+          swipeStart.current = null;
+          return;
+        }
+        const { x, y, sourceWidth, sourceHeight, markerX, markerY } = mapped;
+        showTapMarker(markerX, markerY);
         try {
+          setGroupInputBusy(true);
           const results = selected
-            ? await cmds.tapDevices(x, y, sourceWidth, sourceHeight)
+            ? await cmds.tapDevices(x, y, sourceWidth, sourceHeight, device.serial)
             : await cmds.tapDevice(device, x, y, sourceWidth, sourceHeight);
           const failed = results.filter(r => !r.success);
           if (failed.length > 0) console.error('Tap failed:', failed);
         } catch (err) {
           console.error('Tap error:', err);
+        } finally {
+          setGroupInputBusy(false);
         }
       }
       swipeStart.current = null;
     },
-    [isOnline, selected, device, cmds, mapCoordinates]
+    [
+      isOnline,
+      groupInputBusy,
+      selected,
+      device,
+      cmds,
+      mapCoordinates,
+      mapCoordinatesFromClient,
+      showTapMarker,
+      setGroupInputBusy,
+    ]
   );
 
   const handleCopySerial = useCallback(async (e: React.MouseEvent) => {
@@ -180,7 +228,25 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
   }, [device.serial]);
 
   const statusClass = styles[`status_${device.status}`] ?? styles.status_offline;
-  const hasStream = !!frame;
+  const streamState = status?.status;
+  const streamUnavailable = !!streamState && streamState !== 'connected' && streamState !== 'receiving';
+  const hasStream = !!frame && !streamUnavailable;
+  const showStreamStatus = streamUnavailable || (!hasStream && !screenshot);
+  const streamStatusText = status?.error
+    ? status.error
+    : isOnline
+      ? streamState === 'receiving'
+        ? 'Receiving...'
+        : streamState === 'connected'
+          ? 'Connected...'
+          : streamState === 'disconnected'
+            ? 'Stream disconnected'
+            : streamState === 'reconnecting'
+              ? 'Reconnecting...'
+              : streamState === 'stopped'
+                ? 'Stream stopped'
+                : 'Starting...'
+      : device.status;
 
   return (
     <div className={`${styles.card} ${selected ? styles.cardSelected : ''}`}>
@@ -201,13 +267,19 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
         onMouseUp={handleMouseUp}
         onDragStart={(e) => e.preventDefault()}
       >
+        {tapMarker && (
+          <div
+            className={styles.tapMarker}
+            style={{ left: tapMarker.x, top: tapMarker.y }}
+          />
+        )}
         {/* Canvas for WebCodecs stream — always mounted for registration, hidden when no frames */}
         <canvas
           ref={canvasRef}
           className={styles.img}
           style={{ display: hasStream ? 'block' : 'none', pointerEvents: 'none' }}
         />
-        {!hasStream && screenshot ? (
+        {!hasStream && screenshot && !streamUnavailable ? (
           <img
             ref={imgElementRef}
             src={screenshot}
@@ -216,25 +288,14 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
             draggable={false}
             style={{ pointerEvents: 'none' }}
           />
-        ) : !hasStream ? (
-          <div className={styles.placeholder}>
+        ) : showStreamStatus ? (
+          <div className={`${styles.placeholder} ${streamUnavailable ? styles.streamDisconnected : ''}`}>
             <div style={{ fontSize: 12, opacity: 0.85 }}>
               {status?.status ? `Stream: ${status.status}` : 'Stream: (none)'}
             </div>
-            {status?.error && (
-              <div style={{ fontSize: 12, opacity: 0.95, color: '#ff6b6b', marginTop: 4 }}>
-                {status.error}
-              </div>
-            )}
-            {!status?.error && (
-              isOnline
-                ? (status?.status === 'receiving'
-                  ? 'Receiving...'
-                  : status?.status === 'connected'
-                    ? 'Connected...'
-                    : 'Starting...')
-                : device.status
-            )}
+            <div className={status?.error ? styles.streamErrorText : undefined}>
+              {streamStatusText}
+            </div>
           </div>
         ) : null}
       </div>

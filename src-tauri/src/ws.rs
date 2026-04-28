@@ -5,8 +5,8 @@ use std::{
 };
 
 use bytes::Bytes;
-use tokio::{net::TcpListener, sync::mpsc};
 use futures_util::{SinkExt, StreamExt};
+use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
 /// Wire format:
@@ -31,14 +31,9 @@ impl WsHub {
         // [u32 height_be]
         // [jpeg bytes]
         let serial_bytes = serial.as_bytes();
-        let serial_len: u16 = serial_bytes
-            .len()
-            .try_into()
-            .unwrap_or(u16::MAX);
+        let serial_len: u16 = serial_bytes.len().try_into().unwrap_or(u16::MAX);
 
-        let mut out = Vec::with_capacity(
-            1 + 2 + serial_bytes.len() + 4 + 4 + jpeg.len(),
-        );
+        let mut out = Vec::with_capacity(1 + 2 + serial_bytes.len() + 4 + 4 + jpeg.len());
         out.push(2);
         out.extend_from_slice(&serial_len.to_be_bytes());
         out.extend_from_slice(serial_bytes);
@@ -62,9 +57,8 @@ impl WsHub {
         let serial_bytes = serial.as_bytes();
         let serial_len: u16 = serial_bytes.len().try_into().unwrap_or(u16::MAX);
 
-        let mut out = Vec::with_capacity(
-            1 + 2 + serial_bytes.len() + 1 + 8 + 4 + 4 + nal_data.len(),
-        );
+        let mut out =
+            Vec::with_capacity(1 + 2 + serial_bytes.len() + 1 + 8 + 4 + 4 + nal_data.len());
         out.push(3); // version
         out.extend_from_slice(&serial_len.to_be_bytes());
         out.extend_from_slice(serial_bytes);
@@ -134,9 +128,13 @@ pub async fn run_ws_server(hub: WsHub, addr: SocketAddr) -> Result<(), String> {
                         match typ {
                             "subscribe" => {
                                 if !subscribed.contains_key(serial) {
-                                    let id = hub.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    let id = hub
+                                        .next_id
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                     let mut map = hub.inner.lock().unwrap();
-                                    map.entry(serial.to_string()).or_default().push((id, out_tx.clone()));
+                                    map.entry(serial.to_string())
+                                        .or_default()
+                                        .push((id, out_tx.clone()));
                                     subscribed.insert(serial.to_string(), id);
                                 }
                             }
@@ -180,7 +178,9 @@ mod tests {
         assert_eq!(frame[0], 2, "version");
         let serial_len = u16::from_be_bytes([frame[1], frame[2]]) as usize;
         let mut off = 3;
-        let serial = std::str::from_utf8(&frame[off..off + serial_len]).unwrap().to_string();
+        let serial = std::str::from_utf8(&frame[off..off + serial_len])
+            .unwrap()
+            .to_string();
         off += serial_len;
         let width = u32::from_be_bytes(frame[off..off + 4].try_into().unwrap());
         off += 4;
@@ -221,12 +221,18 @@ mod tests {
         assert_eq!(frame[0], 3, "version");
         let serial_len = u16::from_be_bytes([frame[1], frame[2]]) as usize;
         let mut off = 3;
-        let serial = std::str::from_utf8(&frame[off..off + serial_len]).unwrap().to_string();
+        let serial = std::str::from_utf8(&frame[off..off + serial_len])
+            .unwrap()
+            .to_string();
         off += serial_len;
-        let packet_type = frame[off]; off += 1;
-        let pts = u64::from_be_bytes(frame[off..off + 8].try_into().unwrap()); off += 8;
-        let width = u32::from_be_bytes(frame[off..off + 4].try_into().unwrap()); off += 4;
-        let height = u32::from_be_bytes(frame[off..off + 4].try_into().unwrap()); off += 4;
+        let packet_type = frame[off];
+        off += 1;
+        let pts = u64::from_be_bytes(frame[off..off + 8].try_into().unwrap());
+        off += 8;
+        let width = u32::from_be_bytes(frame[off..off + 4].try_into().unwrap());
+        off += 4;
+        let height = u32::from_be_bytes(frame[off..off + 4].try_into().unwrap());
+        off += 4;
         (serial, packet_type, pts, width, height, &frame[off..])
     }
 

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../../store';
 import { useAdbCommands } from '../../hooks/useAdbCommands';
@@ -11,6 +11,24 @@ const FIXED_HEADER_HEIGHT = 33;
 const FIXED_FOOTER_HEIGHT = 30;
 const GRID_GAP = 10;
 const GRID_PADDING = 12;
+
+function streamOptionsFor(count: number, overviewMode: boolean, fps: number) {
+  if (overviewMode || count > 20) {
+    return {
+      max_size: 360,
+      max_fps: Math.max(1, Math.min(fps, 2)),
+      bit_rate: 400_000,
+    };
+  }
+  if (count > 12) {
+    return {
+      max_size: 480,
+      max_fps: Math.max(1, Math.min(fps, 4)),
+      bit_rate: 900_000,
+    };
+  }
+  return { max_size: 720, max_fps: fps, bit_rate: 4_000_000 };
+}
 
 function useAutoScale(
   containerRef: React.RefObject<HTMLDivElement | null>,
@@ -83,38 +101,69 @@ export function DeviceGrid() {
   const gridRef = useRef<HTMLDivElement>(null);
   const scaleCount = overviewMode ? enabledDevices.length : pageDevices.length;
   const scale = useAutoScale(gridRef, scaleCount);
+  const currentOnlineCount = pageDevices.filter((d) => d.status === 'online').length;
+  const streamOptions = useMemo(
+    () => streamOptionsFor(currentOnlineCount, overviewMode, fps),
+    [currentOnlineCount, overviewMode, fps]
+  );
 
-  // Track previous page serials to start/stop previews on page change
-  const prevSerialsRef = useRef<Set<string>>(new Set());
+  // Track streams that have actually been started and kept warm.
+  const warmedSerialsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     const currentOnlineDevices = pageDevices.filter((d) => d.status === 'online');
-    const currentSerials = new Set(currentOnlineDevices.map((d) => d.serial));
-    const prev = prevSerialsRef.current;
+    const prefetchDevices = overviewMode
+      ? []
+      : enabledDevices
+          .slice(
+            Math.max(0, (page - 1) * pageSize),
+            Math.min(enabledDevices.length, (page + 2) * pageSize),
+          )
+          .filter(
+            (d) => d.status === 'online' && !currentOnlineDevices.some((cur) => cur.serial === d.serial),
+          );
+    const targetDevices = [...currentOnlineDevices, ...prefetchDevices];
+    const currentSerials = new Set(targetDevices.map((d) => d.serial));
+    const warmed = warmedSerialsRef.current;
+    let cancelled = false;
 
-    // Stop preview for devices no longer on current page
-    for (const serial of prev) {
+    // Stop streams that are no longer on the current or adjacent pages.
+    for (const serial of Array.from(warmed)) {
       if (!currentSerials.has(serial)) {
         invoke('stop_stream', { serial }).catch(() => {});
+        warmed.delete(serial);
       }
     }
 
-    const newDevices = currentOnlineDevices.filter((d) => !prev.has(d.serial));
-
-    // Start stream for new devices on current page
-    for (const d of newDevices) {
+    const startDevice = (d: typeof targetDevices[number]) => {
+      if (warmedSerialsRef.current.has(d.serial)) return;
+      warmedSerialsRef.current.add(d.serial);
       invoke('start_stream', {
         serial: d.serial,
         serverHost: d.server_host,
         serverPort: d.server_port,
-        options: { max_size: 720, max_fps: fps, bit_rate: 4_000_000 },
-      }).catch(() => {});
-    }
+        options: streamOptions,
+      }).catch(() => {
+        warmedSerialsRef.current.delete(d.serial);
+      });
+    };
 
-    // Auto wake up only newly appeared devices on current page
-    if (newDevices.length > 0) {
+    const newCurrentDevices = currentOnlineDevices.filter((d) => !warmed.has(d.serial));
+    const newPrefetchDevices = prefetchDevices.filter((d) => !warmed.has(d.serial));
+
+    // Start visible streams first; prefetch neighbors shortly after so page
+    // flips are warm without stealing the first ADB slots from the current page.
+    for (const d of newCurrentDevices) startDevice(d);
+    const prefetchTimer = window.setTimeout(() => {
+      if (cancelled) return;
+      for (const d of newPrefetchDevices) startDevice(d);
+    }, 800);
+
+    // Auto wake after stream startup has had a chance to claim ADB capacity.
+    const wakeTimer = window.setTimeout(() => {
+      if (cancelled || newCurrentDevices.length === 0) return;
       cmds.wakeUpDevices(
-        newDevices.map((d) => ({
+        newCurrentDevices.map((d) => ({
           serial: d.serial,
           width: d.screen_width,
           height: d.screen_height,
@@ -122,10 +171,24 @@ export function DeviceGrid() {
           server_port: d.server_port,
         }))
       ).catch(() => {});
-    }
+    }, 1200);
 
-    prevSerialsRef.current = currentSerials;
-  }, [page, overviewMode, pageDevices.map((d) => `${d.serial}:${d.status}`).join(','), fps, cmds]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(prefetchTimer);
+      window.clearTimeout(wakeTimer);
+    };
+  }, [
+    page,
+    overviewMode,
+    enabledDevices.map((d) => `${d.serial}:${d.status}`).join(','),
+    fps,
+    pageSize,
+    streamOptions.max_size,
+    streamOptions.max_fps,
+    streamOptions.bit_rate,
+    cmds,
+  ]);
 
   if (devices.length === 0) {
     return (
@@ -160,6 +223,7 @@ export function DeviceGrid() {
               device={device}
               screenshot={screenshots[device.serial]}
               selected={selectedSerials.has(device.serial)}
+              streamOptions={streamOptions}
             />
           </div>
         ))}

@@ -29,7 +29,6 @@ uuid = { version = "1", features = ["v4"] }
 futures = "0.3"
 dirs-next = "2"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-wait-timeout = "0.2"
 
 # Local WebSocket for high-frequency video frames
 tokio-tungstenite = "0.27"

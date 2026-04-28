@@ -1,12 +1,12 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
-use tokio::sync::Mutex;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use super::device::{parse_adb_devices, server_args, Device};
 use crate::config::ServerConfig;
-use super::device::{Device, parse_adb_devices, server_args};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdbServer {
@@ -62,7 +62,8 @@ fn run_adb_timeout(args: &[String], timeout_secs: u64) -> String {
         }
     }
 
-    child.wait_with_output()
+    child
+        .wait_with_output()
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default()
 }
@@ -110,7 +111,9 @@ fn fetch_device_info(serial: &str, srv: &AdbServer) -> Device {
             for line in battery_output.lines() {
                 let line = line.trim();
                 if line.starts_with("level:") {
-                    battery = line.split(':').last()
+                    battery = line
+                        .split(':')
+                        .last()
                         .and_then(|v| v.trim().parse().ok())
                         .unwrap_or(-1);
                     break;
@@ -119,8 +122,10 @@ fn fetch_device_info(serial: &str, srv: &AdbServer) -> Device {
         }
     }
 
-    println!("[DEVICE] serial={} model={} battery={} screen={}x{}",
-        serial, model, battery, screen_width, screen_height);
+    println!(
+        "[DEVICE] serial={} model={} battery={} screen={}x{}",
+        serial, model, battery, screen_width, screen_height
+    );
 
     Device {
         serial: serial.to_string(),
@@ -134,10 +139,7 @@ fn fetch_device_info(serial: &str, srv: &AdbServer) -> Device {
     }
 }
 
-pub async fn poll_all_servers(
-    servers: Arc<Mutex<Vec<AdbServer>>>,
-    app: AppHandle,
-) {
+pub async fn poll_all_servers(servers: Arc<Mutex<Vec<AdbServer>>>, app: AppHandle) {
     let servers = servers.lock().await.clone();
     let mut tasks = Vec::new();
 
@@ -162,8 +164,11 @@ pub async fn poll_all_servers(
                     info_tasks.push(tokio::spawn(async move {
                         tokio::time::timeout(
                             std::time::Duration::from_secs(10),
-                            tokio::task::spawn_blocking(move || fetch_device_info(&serial, &srv))
-                        ).await.ok().and_then(|r| r.ok())
+                            tokio::task::spawn_blocking(move || fetch_device_info(&serial, &srv)),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|r| r.ok())
                     }));
                 } else {
                     devices.push(Device {

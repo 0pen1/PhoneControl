@@ -23,6 +23,8 @@ export function Toolbar() {
   const savedInputRef = useRef('');
   const cmds = useAdbCommands();
   const selectedCount = useStore((s) => s.selectedSerials.size);
+  const groupInputBusy = useStore((s) => s.groupInputBusy);
+  const setGroupInputBusy = useStore((s) => s.setGroupInputBusy);
 
   async function sendText() {
     if (!text.trim()) return;
@@ -41,6 +43,42 @@ export function Toolbar() {
     const results = await cmds.runShell(shellCmd);
     setShellResults(results);
     setShellCmd('');
+  }
+
+  async function setUsbFileTransfer() {
+    if (selectedCount === 0 || groupInputBusy) return;
+    setGroupInputBusy(true);
+    const state = useStore.getState();
+    const selectedDevices = state.devices.filter(
+      (d) => state.selectedSerials.has(d.serial) && d.status === 'online'
+    );
+    const activeStreams = selectedDevices.filter(
+      (d) => !!state.streamFrames[d.serial] || !!state.streamStatus[d.serial]
+    );
+    try {
+      if (activeStreams.length > 0) {
+        await Promise.allSettled(activeStreams.map((d) => cmds.stopStream(d.serial)));
+        await new Promise((resolve) => setTimeout(resolve, 800));
+      }
+
+      const results = await cmds.setUsbFileTransfer();
+      setShellResults(results);
+    } finally {
+      if (activeStreams.length > 0) {
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const opts = selectedDevices.length > 20
+          ? { max_size: 360, max_fps: 2, bit_rate: 400_000 }
+          : selectedDevices.length > 12
+            ? { max_size: 480, max_fps: 4, bit_rate: 900_000 }
+            : { max_size: 720, max_fps: state.fps, bit_rate: 4_000_000 };
+        await Promise.allSettled(
+          activeStreams.map((d) =>
+            cmds.startStream(d.serial, d.server_host, d.server_port, opts)
+          )
+        );
+      }
+      setGroupInputBusy(false);
+    }
   }
 
   function handleShellKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
@@ -113,6 +151,14 @@ export function Toolbar() {
               {k.label}
             </button>
           ))}
+          <button
+            className={`${styles.keyBtn} ${styles.keyBtnWide}`}
+            title="USB file transfer (MTP)"
+            onClick={setUsbFileTransfer}
+            disabled={selectedCount === 0 || groupInputBusy}
+          >
+            MTP
+          </button>
         </div>
 
         {/* Mode toggle */}

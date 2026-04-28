@@ -11,6 +11,7 @@ export function useScreenshot() {
   const setScreenshot = useStore((s) => s.setScreenshot);
   const setStreamHeartbeat = useStore((s) => s.setStreamHeartbeat);
   const setStreamStatus = useStore((s) => s.setStreamStatus);
+  const clearStreamFrame = useStore((s) => s.clearStreamFrame);
 
   useEffect(() => {
     const unlisten = listen<ScreenshotPayload>('screenshot', (event) => {
@@ -22,12 +23,24 @@ export function useScreenshot() {
     });
 
     const unlistenStatus = listen<{ serial: string; status: string; error?: string }>('stream-status', (event) => {
-      setStreamStatus(event.payload.serial, event.payload.status, event.payload.error);
+      const { serial, status, error } = event.payload;
+      setStreamStatus(serial, status, error);
+      if (status !== 'connected' && status !== 'receiving') {
+        clearStreamFrame(serial);
+      }
     });
+
+    const unlistenError = listen<{ serial: string; error?: string }>('stream-error', (event) => {
+      const { serial, error } = event.payload;
+      setStreamStatus(serial, 'disconnected', error ?? 'video stream error');
+      clearStreamFrame(serial);
+    });
+
     return () => {
       unlisten.then((fn) => fn());
       unlistenHb.then((fn) => fn());
       unlistenStatus.then((fn) => fn());
+      unlistenError.then((fn) => fn());
     };
-  }, [setScreenshot, setStreamHeartbeat, setStreamStatus]);
+  }, [setScreenshot, setStreamHeartbeat, setStreamStatus, clearStreamFrame]);
 }

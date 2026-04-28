@@ -59,6 +59,17 @@
 .screenActive {
   cursor: crosshair;
 }
+.tapMarker {
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  border: 2px solid #ff4a4a;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 3;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.35);
+}
 .img {
   width: 100%;
   height: 100%;
@@ -77,6 +88,16 @@
   text-align: center;
   padding: 10px;
   gap: 6px;
+}
+.streamDisconnected {
+  color: #ff9b9b;
+  background: #111;
+}
+.streamErrorText {
+  color: #ff6b6b;
+  font-size: 12px;
+  opacity: 0.95;
+  margin-top: 4px;
 }
 
 .footer {

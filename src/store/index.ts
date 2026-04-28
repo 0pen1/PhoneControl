@@ -33,10 +33,15 @@ interface AppStore {
   // Latest frame dimensions per device (set when WebCodecs decodes a frame)
   streamFrames: Record<string, { width: number; height: number }>;
   setStreamFrame: (serial: string, width: number, height: number) => void;
+  clearStreamFrame: (serial: string) => void;
 
   // Stream status
   streamStatus: Record<string, { status: string; error?: string }>;
   setStreamStatus: (serial: string, status: string, error?: string) => void;
+
+  // Group input
+  groupInputBusy: boolean;
+  setGroupInputBusy: (busy: boolean) => void;
 
   // FPS
   fps: number;
@@ -103,10 +108,19 @@ export const useStore = create<AppStore>((set) => ({
   streamFrames: {},
   setStreamFrame: (serial, width, height) =>
     set((s) => ({ streamFrames: { ...s.streamFrames, [serial]: { width, height } } })),
+  clearStreamFrame: (serial) =>
+    set((s) => {
+      const next = { ...s.streamFrames };
+      delete next[serial];
+      return { streamFrames: next };
+    }),
 
   streamStatus: {},
   setStreamStatus: (serial, status, error) =>
     set((s) => ({ streamStatus: { ...s.streamStatus, [serial]: { status, error } } })),
+
+  groupInputBusy: false,
+  setGroupInputBusy: (busy) => set({ groupInputBusy: busy }),
 
   fps: 10,
   setFps: (fps) => set({ fps }),

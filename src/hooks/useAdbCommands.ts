@@ -3,18 +3,31 @@ import { useStore } from '../store';
 import type { CommandResult, DeviceResolution, Device } from '../types';
 
 export function useAdbCommands() {
+  const selectedDevices = (primarySerial?: string): DeviceResolution[] => {
+    const { devices, selectedSerials } = useStore.getState();
+    const serials = devices
+      .filter((d) => selectedSerials.has(d.serial) && d.status === 'online')
+      .map((d) => ({
+        serial: d.serial,
+        width: d.screen_width,
+        height: d.screen_height,
+        server_host: d.server_host,
+        server_port: d.server_port,
+      }));
+
+    if (!primarySerial) return serials;
+
+    const idx = serials.findIndex((d) => d.serial === primarySerial);
+    if (idx <= 0) return serials;
+
+    const [primary] = serials.splice(idx, 1);
+    serials.unshift(primary);
+    return serials;
+  };
+
   return {
-    async tapDevices(x: number, y: number, sourceWidth: number, sourceHeight: number): Promise<CommandResult[]> {
-      const { devices, selectedSerials } = useStore.getState();
-      const serials: DeviceResolution[] = devices
-        .filter((d) => selectedSerials.has(d.serial) && d.status === 'online')
-        .map((d) => ({
-          serial: d.serial,
-          width: d.screen_width,
-          height: d.screen_height,
-          server_host: d.server_host,
-          server_port: d.server_port,
-        }));
+    async tapDevices(x: number, y: number, sourceWidth: number, sourceHeight: number, primarySerial?: string): Promise<CommandResult[]> {
+      const serials = selectedDevices(primarySerial);
       return invoke<CommandResult[]>('tap_devices', { serials, x, y, sourceWidth, sourceHeight });
     },
 
@@ -31,18 +44,9 @@ export function useAdbCommands() {
 
     async swipeDevices(
       x1: number, y1: number, x2: number, y2: number,
-      durationMs: number, sourceWidth: number, sourceHeight: number
+      durationMs: number, sourceWidth: number, sourceHeight: number, primarySerial?: string
     ): Promise<CommandResult[]> {
-      const { devices, selectedSerials } = useStore.getState();
-      const serials: DeviceResolution[] = devices
-        .filter((d) => selectedSerials.has(d.serial) && d.status === 'online')
-        .map((d) => ({
-          serial: d.serial,
-          width: d.screen_width,
-          height: d.screen_height,
-          server_host: d.server_host,
-          server_port: d.server_port,
-        }));
+      const serials = selectedDevices(primarySerial);
       return invoke<CommandResult[]>('swipe_devices', { serials, x1, y1, x2, y2, durationMs, sourceWidth, sourceHeight });
     },
 
@@ -87,6 +91,20 @@ export function useAdbCommands() {
           server_port: d.server_port,
         }));
       return invoke<CommandResult[]>('keyevent_devices', { serials, keycode });
+    },
+
+    async setUsbFileTransfer(): Promise<CommandResult[]> {
+      const { devices, selectedSerials } = useStore.getState();
+      const serials: DeviceResolution[] = devices
+        .filter((d) => selectedSerials.has(d.serial) && d.status === 'online')
+        .map((d) => ({
+          serial: d.serial,
+          width: d.screen_width,
+          height: d.screen_height,
+          server_host: d.server_host,
+          server_port: d.server_port,
+        }));
+      return invoke<CommandResult[]>('set_usb_file_transfer_devices', { serials });
     },
 
     startPreview(serial: string, fps: number, serverHost: string, serverPort: number) {

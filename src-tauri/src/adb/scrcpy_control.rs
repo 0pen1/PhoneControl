@@ -31,10 +31,16 @@ pub(crate) fn build_touch_msg(
 }
 
 fn scale(value: f64, source_dim: u32, target_dim: u32) -> i32 {
-    if source_dim == 0 || target_dim == 0 {
-        return value as i32;
+    if target_dim == 0 {
+        return value.round() as i32;
     }
-    ((value / source_dim as f64) * target_dim as f64).round() as i32
+    let scaled = if source_dim == 0 {
+        value
+    } else {
+        (value / source_dim as f64) * target_dim as f64
+    };
+    let max = target_dim.saturating_sub(1) as f64;
+    scaled.round().clamp(0.0, max) as i32
 }
 
 pub fn build_touch_msg_scaled(
@@ -68,7 +74,10 @@ pub fn inject_tap(
 
     println!(
         "[SCRCPY-CTRL] inject_tap scaled=({},{}) screen={}x{} local={:?} peer={:?}",
-        tx, ty, w, h,
+        tx,
+        ty,
+        w,
+        h,
         stream.local_addr().ok(),
         stream.peer_addr().ok()
     );
@@ -76,9 +85,16 @@ pub fn inject_tap(
     let down = build_touch_msg(ACTION_DOWN, tx, ty, w, h, PRESSURE_MAX);
     let up = build_touch_msg(ACTION_UP, tx, ty, w, h, 0);
 
-    stream.write_all(&down).map_err(|e| format!("control write failed: {e}"))?;
-    stream.write_all(&up).map_err(|e| format!("control write failed: {e}"))?;
-    stream.flush().map_err(|e| format!("control flush failed: {e}"))?;
+    let mut tap = [0u8; 64];
+    tap[..32].copy_from_slice(&down);
+    tap[32..].copy_from_slice(&up);
+
+    stream
+        .write_all(&tap)
+        .map_err(|e| format!("control write failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("control flush failed: {e}"))?;
 
     // Verify socket is still alive by checking for errors
     match stream.take_error() {
@@ -118,22 +134,34 @@ pub fn inject_swipe(
     let step_delay = std::time::Duration::from_millis((duration_ms as u64) / (steps as u64));
 
     let down = build_touch_msg(ACTION_DOWN, tx1, ty1, w, h, PRESSURE_MAX);
-    stream.write_all(&down).map_err(|e| format!("control write failed: {e}"))?;
-    stream.flush().map_err(|e| format!("control flush failed: {e}"))?;
+    stream
+        .write_all(&down)
+        .map_err(|e| format!("control write failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("control flush failed: {e}"))?;
 
     for i in 1..steps {
         let t = i as f64 / steps as f64;
         let mx = tx1 + ((tx2 - tx1) as f64 * t).round() as i32;
         let my = ty1 + ((ty2 - ty1) as f64 * t).round() as i32;
         let msg = build_touch_msg(ACTION_MOVE, mx, my, w, h, PRESSURE_MAX);
-        stream.write_all(&msg).map_err(|e| format!("control write failed: {e}"))?;
-        stream.flush().map_err(|e| format!("control flush failed: {e}"))?;
+        stream
+            .write_all(&msg)
+            .map_err(|e| format!("control write failed: {e}"))?;
+        stream
+            .flush()
+            .map_err(|e| format!("control flush failed: {e}"))?;
         std::thread::sleep(step_delay);
     }
 
     let up = build_touch_msg(ACTION_UP, tx2, ty2, w, h, 0);
-    stream.write_all(&up).map_err(|e| format!("control write failed: {e}"))?;
-    stream.flush().map_err(|e| format!("control flush failed: {e}"))?;
+    stream
+        .write_all(&up)
+        .map_err(|e| format!("control write failed: {e}"))?;
+    stream
+        .flush()
+        .map_err(|e| format!("control flush failed: {e}"))?;
     Ok(())
 }
 
@@ -214,5 +242,11 @@ mod tests {
     #[test]
     fn scale_zero_source() {
         assert_eq!(scale(123.0, 0, 1080), 123);
+    }
+
+    #[test]
+    fn scale_clamps_to_target_bounds() {
+        assert_eq!(scale(-10.0, 200, 1080), 0);
+        assert_eq!(scale(200.0, 200, 1080), 1079);
     }
 }

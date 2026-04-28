@@ -62,10 +62,20 @@ mod tests {
         let tmp = env::temp_dir().join("phone_control_test");
         fs::create_dir_all(&tmp).unwrap();
         let servers = vec![
-            ServerConfig { host: "192.168.1.1".into(), port: 5037, enabled: true },
-            ServerConfig { host: "10.0.0.1".into(), port: 5555, enabled: false },
+            ServerConfig {
+                host: "192.168.1.1".into(),
+                port: 5037,
+                enabled: true,
+            },
+            ServerConfig {
+                host: "10.0.0.1".into(),
+                port: 5555,
+                enabled: false,
+            },
         ];
-        let data = ConfigFile { servers: servers.clone() };
+        let data = ConfigFile {
+            servers: servers.clone(),
+        };
         let text = serde_json::to_string_pretty(&data).unwrap();
         let path = tmp.join("servers.json");
         fs::write(&path, &text).unwrap();

@@ -1,10 +1,7 @@
-use std::{
-    io::Read,
-    sync::Arc,
-};
-use tauri::{AppHandle, Emitter};
+use std::{io::Read, sync::Arc};
 use tauri::Manager;
-use tokio::sync::Mutex;
+use tauri::{AppHandle, Emitter};
+use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::ws::WsHub;
@@ -33,6 +30,38 @@ pub(crate) fn parse_codec_fourcc(bytes: &[u8]) -> String {
     }
 }
 
+const CONNECT_BASE_DELAY_MS: u64 = 100;
+const CONNECT_MAX_DELAY_MS: u64 = 1500;
+const MAX_RECONNECT_SLEEP_MS: u64 = 5_000;
+const USB_BOUNCE_FAST_RETRY_WINDOW_MS: u64 = 5_000;
+const STABLE_DISCONNECT_RECONNECT_DELAY_MS: u64 = 500;
+
+fn reconnect_delay_ms(
+    serial: &str,
+    attempt: u32,
+    device_not_found: bool,
+    recent_stream_drop: bool,
+) -> u64 {
+    let raw_delay = if device_not_found {
+        if recent_stream_drop {
+            // USB mode switching briefly removes the device from ADB. Poll
+            // quickly right after a stable stream drops so we do not add
+            // seconds of artificial latency before ADB re-enumerates it.
+            let base = std::cmp::min(900, 120 * attempt.min(8) as u64);
+            base + reconnect_jitter_ms(serial, 180)
+        } else {
+            let base = std::cmp::min(15_000, 2_000 * attempt.min(6) as u64);
+            base + reconnect_jitter_ms(serial, 2_500)
+        }
+    } else {
+        std::cmp::min(
+            CONNECT_MAX_DELAY_MS,
+            CONNECT_BASE_DELAY_MS * (1u64 << attempt.min(3)),
+        ) + reconnect_jitter_ms(serial, 250)
+    };
+    raw_delay.min(MAX_RECONNECT_SLEEP_MS)
+}
+
 pub type StreamTokens = Arc<Mutex<std::collections::HashMap<String, CancellationToken>>>;
 pub struct ControlEntry {
     pub stream: std::net::TcpStream,
@@ -48,6 +77,25 @@ pub fn new_tokens() -> StreamTokens {
 
 pub fn new_control_sockets() -> ControlSockets {
     Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn remove_control_socket(control_sockets: &ControlSockets, serial: &str, reason: &str) {
+    if let Ok(mut sockets) = control_sockets.lock() {
+        if sockets.remove(serial).is_some() {
+            println!(
+                "[SCRCPY-CTRL] removed control socket serial={} reason={}",
+                serial, reason
+            );
+        }
+    }
+}
+
+fn emit_stream_status(app: &AppHandle, serial: &str, status: &str, error: Option<&str>) {
+    let payload = match error {
+        Some(error) => serde_json::json!({"serial": serial, "status": status, "error": error}),
+        None => serde_json::json!({"serial": serial, "status": status}),
+    };
+    let _ = app.emit("stream-status", payload);
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -67,6 +115,14 @@ impl Default for StreamOptions {
     }
 }
 
+fn reconnect_jitter_ms(serial: &str, modulo: u64) -> u64 {
+    if modulo == 0 {
+        0
+    } else {
+        fxhash::hash64(serial) % modulo
+    }
+}
+
 /// Start a scrcpy-based video stream.
 ///
 /// This currently records to stdout as an MKV stream, then decodes frames and emits JPEG data.
@@ -77,6 +133,7 @@ impl Default for StreamOptions {
 pub async fn start_stream_loop(
     tokens: StreamTokens,
     control_sockets: ControlSockets,
+    adb_semaphore: Arc<Semaphore>,
     serial: String,
     host: String,
     port: u16,
@@ -95,50 +152,97 @@ pub async fn start_stream_loop(
         }
     }
 
-    // Backoff for connection-attempt failures. Stream disconnects retry immediately.
-    // USB-mode switches typically recover in 1-2s, so we start small and cap low.
-    // Progression: 100, 200, 400, 800, 1500 (cap).
-    const BASE_DELAY_MS: u64 = 100;
-    const MAX_DELAY_MS: u64 = 1500;
+    // Backoff for connection-attempt failures. Large batches can make many
+    // devices re-enumerate at once, so device-not-found retries use a longer
+    // staggered delay to avoid a reconnect storm against the ADB server.
     let mut attempt: u32 = 0;
     let mut first_run = true;
+    let mut disconnect_count: u32 = 0;
+    let mut fast_retry_until: Option<std::time::Instant> = None;
 
     loop {
-        if token.is_cancelled() { break; }
-
-        let local_port = super::scrcpy_client::scrcpy_local_port(&serial);
+        if token.is_cancelled() {
+            break;
+        }
 
         // Cleanup from previous iteration
-        control_sockets.lock().unwrap().remove(&serial);
-        let _ = std::process::Command::new("adb")
-            .args(["-s", &serial, "forward", "--remove", &format!("tcp:{}", local_port)])
-            .output();
+        remove_control_socket(&control_sockets, &serial, "stream iteration restart");
 
-        let status_label = if first_run { "starting" } else { "reconnecting" };
-        let _ = app.emit("stream-status", serde_json::json!({"serial": serial, "status": status_label}));
+        let status_label = if first_run {
+            "starting"
+        } else {
+            "reconnecting"
+        };
+        let _ = app.emit(
+            "stream-status",
+            serde_json::json!({"serial": serial, "status": status_label}),
+        );
         if !first_run {
-            println!("[STREAM] reconnecting serial={} attempt={}", serial, attempt);
+            println!(
+                "[STREAM] reconnecting serial={} attempt={}",
+                serial, attempt
+            );
         }
         first_run = false;
 
-        // Connect to scrcpy server
+        // Connect to scrcpy server. This is ADB-heavy, so share a global
+        // limiter with group input commands to avoid starving tap/swipe.
+        let adb_permit = tokio::select! {
+            _ = token.cancelled() => { break; }
+            permit = Arc::clone(&adb_semaphore).acquire_owned() => {
+                match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                }
+            }
+        };
+
         let serial_clone = serial.clone();
         let host_clone = host.clone();
         let opts_clone = opts.clone();
         let conn_result = tokio::task::spawn_blocking(move || {
-            super::scrcpy_client::start_scrcpy_and_connect(&serial_clone, &host_clone, port, local_port, &opts_clone)
-        }).await;
+            super::scrcpy_client::start_scrcpy_and_connect(
+                &serial_clone,
+                &host_clone,
+                port,
+                &opts_clone,
+            )
+        })
+        .await;
+        drop(adb_permit);
 
         let scrcpy_conn = match conn_result {
             Ok(Ok(c)) => {
                 attempt = 0;
+                fast_retry_until = None;
                 c
             }
             Ok(Err(e)) => {
                 println!("[STREAM] connect failed serial={}: {}", serial, e);
-                let _ = app.emit("stream-status", serde_json::json!({"serial": serial, "status": "reconnecting", "error": e}));
+                let device_not_found = e.contains("device") && e.contains("not found");
+                let _ = app.emit(
+                    "stream-status",
+                    serde_json::json!({"serial": serial, "status": "reconnecting", "error": e}),
+                );
                 attempt += 1;
-                let delay = std::cmp::min(MAX_DELAY_MS, BASE_DELAY_MS * (1u64 << attempt.min(3)));
+                let recent_stream_drop = fast_retry_until
+                    .map(|deadline| std::time::Instant::now() <= deadline)
+                    .unwrap_or(false);
+                let delay =
+                    reconnect_delay_ms(&serial, attempt, device_not_found, recent_stream_drop);
+                println!(
+                    "[STREAM] reconnect sleep serial={} attempt={} delay={}ms mode={}",
+                    serial,
+                    attempt,
+                    delay,
+                    if device_not_found && recent_stream_drop {
+                        "usb-bounce-fast"
+                    } else if device_not_found {
+                        "device-not-found"
+                    } else {
+                        "normal"
+                    }
+                );
                 tokio::select! {
                     _ = token.cancelled() => { break; }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
@@ -148,7 +252,7 @@ pub async fn start_stream_loop(
             Err(e) => {
                 println!("[STREAM] connect task panicked serial={}: {}", serial, e);
                 attempt += 1;
-                let delay = std::cmp::min(MAX_DELAY_MS, BASE_DELAY_MS * (1u64 << attempt.min(3)));
+                let delay = reconnect_delay_ms(&serial, attempt, false, false);
                 tokio::select! {
                     _ = token.cancelled() => { break; }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
@@ -157,16 +261,24 @@ pub async fn start_stream_loop(
             }
         };
 
-        let _ = app.emit("stream-status", serde_json::json!({"serial": serial, "status": "connected"}));
+        let _ = app.emit(
+            "stream-status",
+            serde_json::json!({"serial": serial, "status": "connected"}),
+        );
+        let connected_at = std::time::Instant::now();
         let stdout = scrcpy_conn.stream;
+        let local_port = scrcpy_conn.local_port;
         let mut server_child = scrcpy_conn.server_child;
 
         if let Some(ctrl) = scrcpy_conn.control {
-            control_sockets.lock().unwrap().insert(serial.clone(), ControlEntry {
-                stream: ctrl,
-                video_width: 0,
-                video_height: 0,
-            });
+            control_sockets.lock().unwrap().insert(
+                serial.clone(),
+                ControlEntry {
+                    stream: ctrl,
+                    video_width: 0,
+                    video_height: 0,
+                },
+            );
         }
 
         let serial_for_task = serial.clone();
@@ -176,7 +288,14 @@ pub async fn start_stream_loop(
         let cs_for_task = Arc::clone(&control_sockets);
         let forward_task = tokio::task::spawn_blocking(move || {
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                forward_h264_to_ws(stdout, &serial_for_task, &token_for_task, &app_for_task, &hub, &cs_for_task)
+                forward_h264_to_ws(
+                    stdout,
+                    &serial_for_task,
+                    &token_for_task,
+                    &app_for_task,
+                    &hub,
+                    &cs_for_task,
+                )
             }));
 
             match res {
@@ -184,45 +303,82 @@ pub async fn start_stream_loop(
                 Ok(Err(e)) => {
                     let _ = app_for_task.emit(
                         "stream-error",
-                        serde_json::json!({ "serial": serial_for_task, "error": e }),
+                        serde_json::json!({ "serial": &serial_for_task, "error": e }),
                     );
                 }
                 Err(_) => {
                     let _ = app_for_task.emit(
                         "stream-error",
-                        serde_json::json!({ "serial": serial_for_task, "error": "panic in stream forward" }),
+                        serde_json::json!({ "serial": &serial_for_task, "error": "panic in stream forward" }),
                     );
                 }
             }
+
+            remove_control_socket(&cs_for_task, &serial_for_task, "stream forward ended");
         });
 
         let cancelled = tokio::select! {
             _ = token.cancelled() => true,
             _ = forward_task => {
                 println!("[STREAM] stream disconnected serial={}", serial);
+                remove_control_socket(&control_sockets, &serial, "stream disconnected");
                 false
             }
         };
 
         let _ = server_child.kill();
-        if cancelled { break; }
+        super::scrcpy_client::remove_forward(&host, port, &serial, local_port);
+        println!(
+            "[SCRCPY] forward listener removed serial={} port={} reason=stream ended",
+            serial, local_port
+        );
+        if cancelled {
+            break;
+        }
 
-        // Stream disconnected — retry immediately (no backoff).
-        // Backoff only applies when the *connection attempt* itself fails.
+        let alive_ms = connected_at.elapsed().as_millis() as u64;
+        if alive_ms >= 2_000 {
+            disconnect_count = 0;
+            fast_retry_until = Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_millis(USB_BOUNCE_FAST_RETRY_WINDOW_MS),
+            );
+            println!(
+                "[STREAM] stable-disconnect reconnect sleep serial={} alive={}ms delay={}ms",
+                serial, alive_ms, STABLE_DISCONNECT_RECONNECT_DELAY_MS
+            );
+            tokio::select! {
+                _ = token.cancelled() => { break; }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(STABLE_DISCONNECT_RECONNECT_DELAY_MS)) => {}
+            }
+            continue;
+        } else {
+            disconnect_count += 1;
+            let raw_delay = std::cmp::min(5_000, 500 * disconnect_count.min(8) as u64)
+                + reconnect_jitter_ms(&serial, 500);
+            let delay = raw_delay.min(MAX_RECONNECT_SLEEP_MS);
+            println!(
+                "[STREAM] rapid-disconnect backoff serial={} count={} alive={}ms delay={}ms",
+                serial, disconnect_count, alive_ms, delay
+            );
+            tokio::select! {
+                _ = token.cancelled() => { break; }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay)) => {}
+            }
+        }
     }
 
     // Final cleanup
-    let local_port = super::scrcpy_client::scrcpy_local_port(&serial);
-    control_sockets.lock().unwrap().remove(&serial);
-    let _ = std::process::Command::new("adb")
-        .args(["-s", &serial, "forward", "--remove", &format!("tcp:{}", local_port)])
-        .output();
+    remove_control_socket(&control_sockets, &serial, "stream loop stopped");
     tokens.lock().await.remove(&serial);
-    let _ = app.emit("stream-status", serde_json::json!({"serial": serial, "status": "stopped"}));
+    let _ = app.emit(
+        "stream-status",
+        serde_json::json!({"serial": serial, "status": "stopped"}),
+    );
 }
 
 pub async fn stop_stream_loop(tokens: StreamTokens, control_sockets: ControlSockets, serial: &str) {
-    control_sockets.lock().unwrap().remove(serial);
+    remove_control_socket(&control_sockets, serial, "stop stream requested");
     let mut map = tokens.lock().await;
     if let Some(token) = map.remove(serial) {
         token.cancel();
@@ -259,7 +415,18 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
     while !token.is_cancelled() {
         let n = match input.read(&mut chunk) {
             Ok(0) => {
-                println!("[SCRCPY-FWD] stream EOF serial={} after {:?}", serial, loop_start.elapsed());
+                remove_control_socket(control_sockets, serial, "stream EOF");
+                emit_stream_status(
+                    app,
+                    serial,
+                    "disconnected",
+                    Some("video stream disconnected"),
+                );
+                println!(
+                    "[SCRCPY-FWD] stream EOF serial={} after {:?}",
+                    serial,
+                    loop_start.elapsed()
+                );
                 break;
             }
             Ok(n) => n,
@@ -275,18 +442,26 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
                     last_idle_log = Some(now);
                     println!(
                         "[SCRCPY-FWD] no bytes from server serial={} waited={:?}",
-                        serial, loop_start.elapsed()
+                        serial,
+                        loop_start.elapsed()
                     );
                 }
                 continue;
             }
-            Err(e) => return Err(format!("read scrcpy stream failed: {e}")),
+            Err(e) => {
+                remove_control_socket(control_sockets, serial, "stream read error");
+                emit_stream_status(app, serial, "disconnected", Some("video stream read error"));
+                return Err(format!("read scrcpy stream failed: {e}"));
+            }
         };
 
         if first_data_at.is_none() {
             first_data_at = Some(std::time::Instant::now());
             println!("[SCRCPY-FWD] first bytes serial={} n={}", serial, n);
-            let _ = app.emit("stream-status", serde_json::json!({"serial": serial, "status": "receiving"}));
+            let _ = app.emit(
+                "stream-status",
+                serde_json::json!({"serial": serial, "status": "receiving"}),
+            );
         }
         buf.extend_from_slice(&chunk[..n]);
 
@@ -308,7 +483,10 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
                 if let Some(entry) = sockets.get_mut(serial) {
                     entry.video_width = video_width;
                     entry.video_height = video_height;
-                    println!("[SCRCPY-FWD] updated control socket video size serial={} {}x{}", serial, video_width, video_height);
+                    println!(
+                        "[SCRCPY-FWD] updated control socket video size serial={} {}x{}",
+                        serial, video_width, video_height
+                    );
                 }
             }
             buf.drain(..12);
@@ -337,7 +515,9 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
                     }
                     println!(
                         "[SCRCPY-FWD] invalid header serial={} buf_len={} head={}...",
-                        serial, buf.len(), hex
+                        serial,
+                        buf.len(),
+                        hex
                     );
                 }
                 buf.drain(..1);
@@ -358,7 +538,8 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
             if is_config {
                 // Config packet — cache and forward as type 0
                 last_config = Some(nal_data.to_vec());
-                let packed = WsHub::pack_h264_frame(serial, 0, pts, video_width, video_height, nal_data);
+                let packed =
+                    WsHub::pack_h264_frame(serial, 0, pts, video_width, video_height, nal_data);
                 hub.broadcast(serial, packed);
             } else {
                 let packet_type = if is_key { 1u8 } else { 2 };
@@ -367,11 +548,19 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
                 // initial config packet due to late WS subscription.
                 if is_key {
                     if let Some(ref cfg) = last_config {
-                        let packed = WsHub::pack_h264_frame(serial, 0, pts, video_width, video_height, cfg);
+                        let packed =
+                            WsHub::pack_h264_frame(serial, 0, pts, video_width, video_height, cfg);
                         hub.broadcast(serial, packed);
                     }
                 }
-                let packed = WsHub::pack_h264_frame(serial, packet_type, pts, video_width, video_height, nal_data);
+                let packed = WsHub::pack_h264_frame(
+                    serial,
+                    packet_type,
+                    pts,
+                    video_width,
+                    video_height,
+                    nal_data,
+                );
                 hub.broadcast(serial, packed);
             }
 
@@ -412,7 +601,10 @@ mod tests {
         // which never matched because the FourCC is a large integer, so
         // codec meta was never drained.
         let codec_id = u32::from_be_bytes([0x68, 0x32, 0x36, 0x34]);
-        assert!(!(1..=3).contains(&codec_id), "h264 FourCC = {codec_id} must not match the old 1..=3 check");
+        assert!(
+            !(1..=3).contains(&codec_id),
+            "h264 FourCC = {codec_id} must not match the old 1..=3 check"
+        );
     }
 
     #[test]
@@ -424,5 +616,32 @@ mod tests {
     #[test]
     fn parse_codec_fourcc_short_bytes() {
         assert_eq!(parse_codec_fourcc(&[0x68, 0x32]), "<2 bytes>");
+    }
+
+    #[test]
+    fn reconnect_delay_uses_fast_retry_after_stable_stream_drop() {
+        let delay = reconnect_delay_ms("device-a", 1, true, true);
+
+        assert!(
+            delay < 300,
+            "first USB-bounce retry should not wait multiple seconds, got {delay}ms"
+        );
+    }
+
+    #[test]
+    fn reconnect_delay_keeps_longer_stagger_for_cold_device_not_found() {
+        let delay = reconnect_delay_ms("device-a", 1, true, false);
+
+        assert!(
+            delay >= 2_000,
+            "cold device-not-found retry should stay staggered, got {delay}ms"
+        );
+    }
+
+    #[test]
+    fn reconnect_delay_is_capped() {
+        let delay = reconnect_delay_ms("device-a", 6, true, false);
+
+        assert_eq!(delay, MAX_RECONNECT_SLEEP_MS);
     }
 }

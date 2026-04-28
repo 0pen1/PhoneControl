@@ -1,8 +1,8 @@
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
+use tauri::{AppHandle, Emitter};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
-use tauri::{AppHandle, Emitter};
-use base64::{engine::general_purpose::STANDARD, Engine};
 
 use super::device::server_args;
 
@@ -28,7 +28,8 @@ pub async fn start_screenshot_loop(
         }
     }
 
-    let interval = std::time::Duration::from_millis(if fps == 0 { 1000 } else { 1000 / fps as u64 });
+    let interval =
+        std::time::Duration::from_millis(if fps == 0 { 1000 } else { 1000 / fps as u64 });
 
     loop {
         tokio::select! {
@@ -56,15 +57,19 @@ pub async fn stop_screenshot_loop(tokens: ScreenshotTokens, serial: &str) {
 
 async fn capture_screenshot(serial: &str, host: &str, port: u16) -> Option<String> {
     let mut args = server_args(host, port);
-    args.extend(["-s".into(), serial.into(), "exec-out".into(),
-        "screencap".into(), "-p".into()]);
+    args.extend([
+        "-s".into(),
+        serial.into(),
+        "exec-out".into(),
+        "screencap".into(),
+        "-p".into(),
+    ]);
 
     let result = tokio::time::timeout(
         std::time::Duration::from_secs(5),
-        tokio::process::Command::new("adb")
-            .args(&args)
-            .output()
-    ).await;
+        tokio::process::Command::new("adb").args(&args).output(),
+    )
+    .await;
 
     let png_data = match result {
         Ok(Ok(out)) if out.status.success() && !out.stdout.is_empty() => out.stdout,

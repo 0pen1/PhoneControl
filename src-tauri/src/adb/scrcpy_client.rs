@@ -37,6 +37,7 @@ pub(crate) fn build_start_argv(
         "audio=false".into(),
         "control=true".into(),
         "tunnel_forward=true".into(),
+        "stay_awake=true".into(),
         format!("max_size={}", opts.max_size),
         format!("max_fps={}", opts.max_fps),
         format!("video_bit_rate={}", opts.bit_rate),
@@ -141,7 +142,7 @@ fn run_adb(host: &str, port: u16, args: &[String]) -> Result<std::process::Outpu
         .map_err(|e| format!("adb spawn failed: {e}"))
 }
 
-fn adb_remove_forward(host: &str, port: u16, serial: &str, local_port: u16) {
+pub fn remove_forward(host: &str, port: u16, serial: &str, local_port: u16) {
     let _ = run_adb(
         host,
         port,
@@ -205,7 +206,10 @@ fn spawn_log_pump(serial: &str, mut reader: impl Read + Send + 'static, stream_n
         // getting dropped silently, making failures look like clean exits.
         if !pending.is_empty() {
             let s = String::from_utf8_lossy(&pending);
-            println!("[SCRCPY-SERVER][{}][{}] (unterminated) {}", serial, stream_name, s);
+            println!(
+                "[SCRCPY-SERVER][{}][{}] (unterminated) {}",
+                serial, stream_name, s
+            );
         }
     });
 }
@@ -237,7 +241,6 @@ pub fn start_scrcpy_and_connect(
     serial: &str,
     server_host: &str,
     server_port: u16,
-    local_port: u16,
     opts: &StreamOptions,
 ) -> Result<ScrcpyConnection, String> {
     // 0) Determine the exact scrcpy version installed (client/server must match).
@@ -245,8 +248,13 @@ pub fn start_scrcpy_and_connect(
 
     // Sanity checks: app_process and CLASSPATH execution.
     // Some remote ADB server setups or restricted shells may prevent starting the server.
-    let _ = adb_shell_check(server_host, server_port, serial, "command -v app_process >/dev/null && echo OK")
-        .map_err(|e| format!("app_process not available: {e}"))?;
+    let _ = adb_shell_check(
+        server_host,
+        server_port,
+        serial,
+        "command -v app_process >/dev/null && echo OK",
+    )
+    .map_err(|e| format!("app_process not available: {e}"))?;
 
     if let Ok(uid) = adb_shell_uid(server_host, server_port, serial) {
         println!("[SCRCPY] shell identity serial={} {}", serial, uid.trim());
@@ -259,8 +267,13 @@ pub fn start_scrcpy_and_connect(
     let local_size = std::fs::metadata(&server_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let remote_size_str = adb_shell_check(server_host, server_port, serial, &format!("wc -c < {} 2>/dev/null || echo 0", remote_path))
-        .unwrap_or_else(|_| "0".to_string());
+    let remote_size_str = adb_shell_check(
+        server_host,
+        server_port,
+        serial,
+        &format!("wc -c < {} 2>/dev/null || echo 0", remote_path),
+    )
+    .unwrap_or_else(|_| "0".to_string());
     let remote_size: u64 = remote_size_str.trim().parse().unwrap_or(0);
 
     if local_size == 0 || local_size != remote_size {
@@ -293,8 +306,15 @@ pub fn start_scrcpy_and_connect(
     }
 
     // 2) Start scrcpy server on device.
-    // scid identifies concurrent clients.
-    let scid = ((fxhash::hash64(serial) as u32) ^ 0x5A17_3C2D) & 0x7FFF_FFFF;
+    // scid identifies concurrent clients. Use random to avoid collision
+    // with a previous server process that hasn't exited yet on the device.
+    let scid = {
+        use std::collections::hash_map::RandomState;
+        use std::hash::{BuildHasher, Hasher};
+        let mut h = RandomState::new().build_hasher();
+        h.write(serial.as_bytes());
+        (h.finish() as u32) & 0x7FFF_FFFF
+    };
     // Note: args are key=value pairs, order irrelevant.
     // We disable audio and control (Phase 1).
     let start_argv = build_start_argv(remote_path, &ver, scid, opts);
@@ -306,11 +326,7 @@ pub fn start_scrcpy_and_connect(
     // Launch style matches the official scrcpy CLI: `adb shell CLASSPATH=... app_process / ...`
     // with individual argv tokens. A `sh -c "..."` wrapper was observed to
     // silence server stderr on some devices (PKG110 / OPPO).
-    let mut argv: Vec<String> = vec![
-        "-s".into(),
-        serial.into(),
-        "shell".into(),
-    ];
+    let mut argv: Vec<String> = vec!["-s".into(), serial.into(), "shell".into()];
     argv.extend(start_argv);
     let mut server_child = run_adb_spawn(server_host, server_port, &argv)?;
 
@@ -337,11 +353,11 @@ pub fn start_scrcpy_and_connect(
     // mode avoids the reverse/forward state machine and the associated races.
     // The server was started with `tunnel_forward=true` to match.
     let socket_name = format!("localabstract:scrcpy_{:08x}", scid);
-    let addr = forward_connect_addr(server_host, local_port);
 
-    // Clear any stale mappings that might still be pointing at this port.
+    // Clear any stale mappings.
     adb_remove_all_reverse(server_host, server_port, serial);
-    adb_remove_forward(server_host, server_port, serial, local_port);
+
+    // Use tcp:0 to let ADB pick a free port, avoiding "Address already in use"
     let out = run_adb(
         server_host,
         server_port,
@@ -349,7 +365,7 @@ pub fn start_scrcpy_and_connect(
             "-s".into(),
             serial.into(),
             "forward".into(),
-            format!("tcp:{local_port}").into(),
+            "tcp:0".into(),
             socket_name.clone().into(),
         ],
     )?;
@@ -360,10 +376,16 @@ pub fn start_scrcpy_and_connect(
             String::from_utf8_lossy(&out.stderr)
         ));
     }
+    // adb forward tcp:0 prints the allocated port on stdout
+    let actual_port: u16 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .map_err(|e| format!("failed to parse allocated port: {e}"))?;
+    let addr = forward_connect_addr(server_host, actual_port);
 
     println!(
-        "[SCRCPY] tunnel forward serial={} local_port={} scid={:08x} adb={}:{}",
-        serial, local_port, scid, server_host, server_port
+        "[SCRCPY] tunnel forward serial={} port={} scid={:08x} adb={}:{}",
+        serial, actual_port, scid, server_host, server_port
     );
 
     // 4) Establish TCP connection with retry.
@@ -387,8 +409,10 @@ pub fn start_scrcpy_and_connect(
                             last_err = Some("immediate EOF (server not ready)".into());
                         }
                         Ok(_) => break s,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut => {
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                || e.kind() == std::io::ErrorKind::TimedOut =>
+                        {
                             // Timeout on peek means the connection is alive but no data yet — good
                             break s;
                         }
@@ -403,6 +427,7 @@ pub fn start_scrcpy_and_connect(
             }
             if start.elapsed() > Duration::from_secs(3) {
                 let _ = server_child.kill();
+                remove_forward(server_host, server_port, serial, actual_port);
                 return Err(format!(
                     "tcp connect failed after retries: {}",
                     last_err.unwrap_or_else(|| "unknown".into())
@@ -412,10 +437,15 @@ pub fn start_scrcpy_and_connect(
         }
     };
 
-    println!("[SCRCPY] tcp connected serial={} local_port={}", serial, local_port);
+    println!(
+        "[SCRCPY] tcp connected serial={} port={}",
+        serial, actual_port
+    );
 
     stream.set_nodelay(true).ok();
-    stream.set_read_timeout(Some(Duration::from_millis(500))).ok();
+    stream
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .ok();
 
     // 5) Connect control socket (second accept on the same abstract socket).
     //
@@ -424,7 +454,10 @@ pub fn start_scrcpy_and_connect(
     // we connect — racing the server can cause the TCP connect to succeed
     // at the adb-forward layer without actually reaching the device.
     std::thread::sleep(Duration::from_millis(100));
-    println!("[SCRCPY] attempting control socket connect serial={} addr={}", serial, addr);
+    println!(
+        "[SCRCPY] attempting control socket connect serial={} addr={}",
+        serial, addr
+    );
     let control = {
         let mut last_err: Option<String> = None;
         let start = std::time::Instant::now();
@@ -457,7 +490,8 @@ pub fn start_scrcpy_and_connect(
             if start.elapsed() > Duration::from_secs(3) {
                 println!(
                     "[SCRCPY] control socket failed serial={}: {} (video-only mode)",
-                    serial, last_err.unwrap_or_else(|| "unknown".into())
+                    serial,
+                    last_err.unwrap_or_else(|| "unknown".into())
                 );
                 break;
             }
@@ -477,16 +511,19 @@ pub fn start_scrcpy_and_connect(
         );
     }
 
-    // Remove the forward listener now that both connections are established.
-    // The existing TCP connections (video + control) survive because they are
-    // independent asocket pairs inside the ADB daemon. Removing the listener
-    // reduces ADB daemon state and prevents new spurious connections.
-    adb_remove_forward(server_host, server_port, serial, local_port);
-    println!("[SCRCPY] forward listener removed serial={} (connections kept)", serial);
+    // Keep the forward mapping for the whole scrcpy session, like the native
+    // scrcpy client does. Removing it immediately leaves active connections
+    // relying only on existing asocket pairs; with a remote ADB server and many
+    // devices, batch control writes have been observed to make those sessions
+    // EOF before the injected event is visible.
+    println!(
+        "[SCRCPY] forward listener kept serial={} port={} for active session",
+        serial, actual_port
+    );
 
     Ok(ScrcpyConnection {
         serial: serial.to_string(),
-        local_port,
+        local_port: actual_port,
         stream,
         control,
         server_child,
@@ -518,14 +555,24 @@ mod tests {
 
     #[test]
     fn build_start_cmd_includes_options() {
-        let opts = StreamOptions { max_size: 1080, max_fps: 60, bit_rate: 8_000_000 };
+        let opts = StreamOptions {
+            max_size: 1080,
+            max_fps: 60,
+            bit_rate: 8_000_000,
+        };
         let cmd = build_start_cmd("/data/local/tmp/scrcpy-server.jar", "3.2", 0xabcd, &opts);
         assert!(cmd.contains("max_size=1080"), "cmd={cmd}");
         assert!(cmd.contains("max_fps=60"), "cmd={cmd}");
         assert!(cmd.contains("video_bit_rate=8000000"), "cmd={cmd}");
         assert!(cmd.contains("scid=0000abcd"), "cmd={cmd}");
-        assert!(cmd.contains("CLASSPATH=/data/local/tmp/scrcpy-server.jar"), "cmd={cmd}");
-        assert!(cmd.contains("com.genymobile.scrcpy.Server 3.2"), "cmd={cmd}");
+        assert!(
+            cmd.contains("CLASSPATH=/data/local/tmp/scrcpy-server.jar"),
+            "cmd={cmd}"
+        );
+        assert!(
+            cmd.contains("com.genymobile.scrcpy.Server 3.2"),
+            "cmd={cmd}"
+        );
     }
 
     #[test]
@@ -560,16 +607,13 @@ mod tests {
     fn scrcpy_local_port_avoids_ws_server_port() {
         // WS server listens on 127.0.0.1:32199. Forward port must never land
         // on it, regardless of the serial.
-        for serial in [
-            "",
-            "a",
-            "3B65BQ01MW300000",
-            "device-测试",
-            "emulator-5554",
-        ] {
+        for serial in ["", "a", "3B65BQ01MW300000", "device-测试", "emulator-5554"] {
             let p = scrcpy_local_port(serial);
             assert_ne!(p, 32199, "serial={serial} -> port {p} collides with WS");
-            assert!((32200..=39999).contains(&p), "serial={serial} -> port {p} out of range");
+            assert!(
+                (32200..=39999).contains(&p),
+                "serial={serial} -> port {p} out of range"
+            );
         }
     }
 
@@ -584,7 +628,10 @@ mod tests {
     fn forward_connect_addr_uses_server_host() {
         // For a remote ADB server, `adb forward` listens on the REMOTE host.
         // Connecting to 127.0.0.1 here was the "Connection refused" bug.
-        assert_eq!(forward_connect_addr("192.168.0.136", 32278), "192.168.0.136:32278");
+        assert_eq!(
+            forward_connect_addr("192.168.0.136", 32278),
+            "192.168.0.136:32278"
+        );
         assert_eq!(forward_connect_addr("10.0.0.5", 32200), "10.0.0.5:32200");
     }
 
@@ -601,13 +648,21 @@ mod tests {
         // sh -c wrapper was observed to swallow server stderr on OPPO PKG110.
         // Each argument must stand alone so `adb shell` gets them as separate
         // args, the way the CLI does.
-        let argv = build_start_argv("/data/local/tmp/scrcpy-server.jar", "3.2", 0xabcd, &StreamOptions::default());
+        let argv = build_start_argv(
+            "/data/local/tmp/scrcpy-server.jar",
+            "3.2",
+            0xabcd,
+            &StreamOptions::default(),
+        );
 
         // Must NOT contain spaces in any single token (would indicate a joined blob).
         // Note: some scrcpy key=value args legitimately contain multiple '=' signs
         // (e.g. "video_codec_options=i-frame-interval=2"), so we only check for spaces.
         for token in &argv {
-            assert!(!token.contains(' '), "token {token:?} contains a space — still a joined blob");
+            assert!(
+                !token.contains(' '),
+                "token {token:?} contains a space — still a joined blob"
+            );
         }
 
         // Required tokens, in argv form.
@@ -620,11 +675,16 @@ mod tests {
         assert!(argv.iter().any(|a| a == "tunnel_forward=true"));
         assert!(argv.iter().any(|a| a == "audio=false"));
         assert!(argv.iter().any(|a| a == "control=true"));
+        assert!(argv.iter().any(|a| a == "stay_awake=true"));
     }
 
     #[test]
     fn build_start_argv_threads_stream_options() {
-        let opts = StreamOptions { max_size: 1080, max_fps: 60, bit_rate: 8_000_000 };
+        let opts = StreamOptions {
+            max_size: 1080,
+            max_fps: 60,
+            bit_rate: 8_000_000,
+        };
         let argv = build_start_argv("/x.jar", "3.2", 1, &opts);
         assert!(argv.iter().any(|a| a == "max_size=1080"));
         assert!(argv.iter().any(|a| a == "max_fps=60"));
