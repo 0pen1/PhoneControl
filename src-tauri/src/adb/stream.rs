@@ -326,7 +326,7 @@ pub async fn start_stream_loop(
             }
         };
 
-        let _ = server_child.kill();
+        super::scrcpy_client::terminate_child(&mut server_child);
         super::scrcpy_client::remove_forward(&host, port, &serial, local_port);
         println!(
             "[SCRCPY] forward listener removed serial={} port={} reason=stream ended",

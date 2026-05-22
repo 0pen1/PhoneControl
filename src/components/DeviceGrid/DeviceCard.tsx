@@ -10,10 +10,9 @@ interface Props {
   device: Device;
   screenshot: string | undefined;
   selected: boolean;
-  streamOptions: { max_size: number; max_fps: number; bit_rate: number };
 }
 
-function DeviceCardInner({ device, screenshot, selected, streamOptions }: Props) {
+function DeviceCardInner({ device, screenshot, selected }: Props) {
   const toggleSelect = useStore((s) => s.toggleSelect);
   const toggleDisableDevice = useStore((s) => s.toggleDisableDevice);
   const groupInputBusy = useStore((s) => s.groupInputBusy);
@@ -39,14 +38,8 @@ function DeviceCardInner({ device, screenshot, selected, streamOptions }: Props)
 
   const handleSelect = useCallback(() => {
     if (!isOnline) return;
-    const wasSelected = selected;
     toggleSelect(device.serial);
-    if (!wasSelected) {
-      cmds.startStream(device.serial, device.server_host, device.server_port, streamOptions);
-    } else {
-      cmds.stopStream(device.serial);
-    }
-  }, [device.serial, device.server_host, device.server_port, selected, isOnline, streamOptions, cmds, toggleSelect]);
+  }, [device.serial, isOnline, toggleSelect]);
 
   // Compute image-space coordinates from a mouse event on the screen div.
   // Works with both <canvas> (stream) and <img> (screenshot fallback).

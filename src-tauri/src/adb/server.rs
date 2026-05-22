@@ -54,11 +54,16 @@ fn run_adb_timeout(args: &[String], timeout_secs: u64) -> String {
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
+                    let _ = child.wait();
                     return String::new();
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(_) => return String::new(),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return String::new();
+            }
         }
     }
 

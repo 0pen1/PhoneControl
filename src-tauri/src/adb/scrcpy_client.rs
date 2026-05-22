@@ -1,6 +1,8 @@
 use std::{
+    collections::HashSet,
     io::{Read, Write},
     net::TcpStream,
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -117,6 +119,80 @@ fn scrcpy_server_installed_path() -> Result<String, String> {
     Err("scrcpy-server path not found (set SCRCPY_SERVER_PATH)".into())
 }
 
+#[derive(Clone)]
+struct ScrcpyRuntimeInfo {
+    version: String,
+    server_path: String,
+    server_size: u64,
+}
+
+static SCRCPY_RUNTIME_INFO: OnceLock<Result<ScrcpyRuntimeInfo, String>> = OnceLock::new();
+
+fn scrcpy_runtime_info() -> Result<ScrcpyRuntimeInfo, String> {
+    SCRCPY_RUNTIME_INFO
+        .get_or_init(|| {
+            let version = scrcpy_version()?;
+            let server_path = scrcpy_server_installed_path()?;
+            let server_size = std::fs::metadata(&server_path)
+                .map_err(|e| format!("scrcpy-server metadata failed: {e}"))?
+                .len();
+            if server_size == 0 {
+                return Err("scrcpy-server file is empty".into());
+            }
+            println!(
+                "[SCRCPY] runtime cached ver={} server={} size={}",
+                version, server_path, server_size
+            );
+            Ok(ScrcpyRuntimeInfo {
+                version,
+                server_path,
+                server_size,
+            })
+        })
+        .clone()
+}
+
+fn parse_first_u64(s: &str) -> Option<u64> {
+    s.split(|c: char| !c.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse().ok())
+}
+
+static VERIFIED_REMOTE_SERVERS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+
+fn verified_remote_servers() -> &'static Mutex<HashSet<String>> {
+    VERIFIED_REMOTE_SERVERS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn remote_server_cache_key(
+    host: &str,
+    port: u16,
+    serial: &str,
+    remote_path: &str,
+    size: u64,
+) -> String {
+    format!("{host}:{port}:{serial}:{remote_path}:{size}")
+}
+
+fn mark_remote_server_verified(key: &str) {
+    if let Ok(mut cache) = verified_remote_servers().lock() {
+        cache.insert(key.to_string());
+    }
+}
+
+fn is_remote_server_verified(key: &str) -> bool {
+    verified_remote_servers()
+        .lock()
+        .map(|cache| cache.contains(key))
+        .unwrap_or(false)
+}
+
+fn clear_remote_server_verified(key: &str) {
+    if let Ok(mut cache) = verified_remote_servers().lock() {
+        cache.remove(key);
+    }
+}
+
 /// Minimal scrcpy bootstrapper.
 ///
 /// Phase 1 goal: establish a TCP connection to scrcpy server and read some bytes.
@@ -156,19 +232,6 @@ pub fn remove_forward(host: &str, port: u16, serial: &str, local_port: u16) {
     );
 }
 
-fn adb_remove_all_reverse(host: &str, port: u16, serial: &str) {
-    let _ = run_adb(
-        host,
-        port,
-        &[
-            "-s".into(),
-            serial.into(),
-            "reverse".into(),
-            "--remove-all".into(),
-        ],
-    );
-}
-
 fn run_adb_spawn(host: &str, port: u16, args: &[String]) -> Result<std::process::Child, String> {
     let mut full = server_args(host, port);
     full.extend_from_slice(args);
@@ -178,6 +241,14 @@ fn run_adb_spawn(host: &str, port: u16, args: &[String]) -> Result<std::process:
         .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("adb spawn failed: {e}"))
+}
+
+pub fn terminate_child(child: &mut std::process::Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn spawn_log_pump(serial: &str, mut reader: impl Read + Send + 'static, stream_name: &'static str) {
@@ -233,76 +304,90 @@ fn adb_shell_check(host: &str, port: u16, serial: &str, cmd: &str) -> Result<Str
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-fn adb_shell_uid(host: &str, port: u16, serial: &str) -> Result<String, String> {
-    adb_shell_check(host, port, serial, "id -u && id -un")
-}
-
 pub fn start_scrcpy_and_connect(
     serial: &str,
     server_host: &str,
     server_port: u16,
     opts: &StreamOptions,
 ) -> Result<ScrcpyConnection, String> {
-    // 0) Determine the exact scrcpy version installed (client/server must match).
-    let ver = scrcpy_version()?;
-
-    // Sanity checks: app_process and CLASSPATH execution.
-    // Some remote ADB server setups or restricted shells may prevent starting the server.
-    let _ = adb_shell_check(
-        server_host,
-        server_port,
-        serial,
-        "command -v app_process >/dev/null && echo OK",
-    )
-    .map_err(|e| format!("app_process not available: {e}"))?;
-
-    if let Ok(uid) = adb_shell_uid(server_host, server_port, serial) {
-        println!("[SCRCPY] shell identity serial={} {}", serial, uid.trim());
-    }
+    let started_at = std::time::Instant::now();
+    // 0) Determine local scrcpy metadata once per app process. Running
+    // `scrcpy --version` and probing the server path for every phone adds a
+    // serialized cost to large pages.
+    let runtime = scrcpy_runtime_info()?;
+    let ver = runtime.version;
 
     // 1) Push server to device only if not already present (saves ~1s).
-    let server_path = scrcpy_server_installed_path()?;
     let remote_path = "/data/local/tmp/scrcpy-server.jar";
-
-    let local_size = std::fs::metadata(&server_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let remote_size_str = adb_shell_check(
+    let remote_cache_key = remote_server_cache_key(
         server_host,
         server_port,
         serial,
-        &format!("wc -c < {} 2>/dev/null || echo 0", remote_path),
-    )
-    .unwrap_or_else(|_| "0".to_string());
-    let remote_size: u64 = remote_size_str.trim().parse().unwrap_or(0);
+        remote_path,
+        runtime.server_size,
+    );
 
-    if local_size == 0 || local_size != remote_size {
-        let out = run_adb(
-            server_host,
-            server_port,
-            &[
-                "-s".into(),
-                serial.into(),
-                "push".into(),
-                server_path,
-                remote_path.into(),
-            ],
-        )?;
-        if !out.status.success() {
-            return Err(format!(
-                "adb push failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            ));
-        }
+    if is_remote_server_verified(&remote_cache_key) {
         println!(
-            "[SCRCPY] server pushed serial={} remote={} ver={}",
-            serial, remote_path, ver
+            "[SCRCPY] server cache hit serial={} ver={} elapsed={}ms",
+            serial,
+            ver,
+            started_at.elapsed().as_millis()
         );
     } else {
+        let remote_size_str = adb_shell_check(
+            server_host,
+            server_port,
+            serial,
+            &format!(
+                "stat -c %s {0} 2>/dev/null || wc -c < {0} 2>/dev/null || echo 0",
+                remote_path
+            ),
+        )
+        .unwrap_or_else(|_| "0".to_string());
+        let remote_size = parse_first_u64(&remote_size_str).unwrap_or(0);
         println!(
-            "[SCRCPY] server already on device serial={} ver={}",
-            serial, ver
+            "[SCRCPY] server size check serial={} local={} remote={} elapsed={}ms",
+            serial,
+            runtime.server_size,
+            remote_size,
+            started_at.elapsed().as_millis()
         );
+
+        if runtime.server_size != remote_size {
+            let out = run_adb(
+                server_host,
+                server_port,
+                &[
+                    "-s".into(),
+                    serial.into(),
+                    "push".into(),
+                    runtime.server_path,
+                    remote_path.into(),
+                ],
+            )?;
+            if !out.status.success() {
+                return Err(format!(
+                    "adb push failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ));
+            }
+            println!(
+                "[SCRCPY] server pushed serial={} remote={} ver={} elapsed={}ms",
+                serial,
+                remote_path,
+                ver,
+                started_at.elapsed().as_millis()
+            );
+        } else {
+            println!(
+                "[SCRCPY] server already on device serial={} ver={} elapsed={}ms",
+                serial,
+                ver,
+                started_at.elapsed().as_millis()
+            );
+        }
+        mark_remote_server_verified(&remote_cache_key);
     }
 
     // 2) Start scrcpy server on device.
@@ -328,11 +413,16 @@ pub fn start_scrcpy_and_connect(
     // silence server stderr on some devices (PKG110 / OPPO).
     let mut argv: Vec<String> = vec!["-s".into(), serial.into(), "shell".into()];
     argv.extend(start_argv);
-    let mut server_child = run_adb_spawn(server_host, server_port, &argv)?;
+    let mut server_child = run_adb_spawn(server_host, server_port, &argv).map_err(|e| {
+        clear_remote_server_verified(&remote_cache_key);
+        e
+    })?;
 
     println!(
-        "[SCRCPY] server started serial={} scid={:08x} (adb shell kept alive)",
-        serial, scid
+        "[SCRCPY] server started serial={} scid={:08x} elapsed={}ms (adb shell kept alive)",
+        serial,
+        scid,
+        started_at.elapsed().as_millis()
     );
 
     if let Some(stdout) = server_child.stdout.take() {
@@ -342,9 +432,6 @@ pub fn start_scrcpy_and_connect(
         spawn_log_pump(serial, stderr, "stderr");
     }
 
-    // Give the process a short moment to fail fast and emit logs.
-    std::thread::sleep(Duration::from_millis(100));
-
     // 3) Set up the forward tunnel.
     //
     // We always use forward tunnel (server listens on the localabstract socket,
@@ -353,9 +440,6 @@ pub fn start_scrcpy_and_connect(
     // mode avoids the reverse/forward state machine and the associated races.
     // The server was started with `tunnel_forward=true` to match.
     let socket_name = format!("localabstract:scrcpy_{:08x}", scid);
-
-    // Clear any stale mappings.
-    adb_remove_all_reverse(server_host, server_port, serial);
 
     // Use tcp:0 to let ADB pick a free port, avoiding "Address already in use"
     let out = run_adb(
@@ -370,7 +454,8 @@ pub fn start_scrcpy_and_connect(
         ],
     )?;
     if !out.status.success() {
-        let _ = server_child.kill();
+        terminate_child(&mut server_child);
+        clear_remote_server_verified(&remote_cache_key);
         return Err(format!(
             "adb forward failed: {}",
             String::from_utf8_lossy(&out.stderr)
@@ -384,8 +469,13 @@ pub fn start_scrcpy_and_connect(
     let addr = forward_connect_addr(server_host, actual_port);
 
     println!(
-        "[SCRCPY] tunnel forward serial={} port={} scid={:08x} adb={}:{}",
-        serial, actual_port, scid, server_host, server_port
+        "[SCRCPY] tunnel forward serial={} port={} scid={:08x} adb={}:{} elapsed={}ms",
+        serial,
+        actual_port,
+        scid,
+        server_host,
+        server_port,
+        started_at.elapsed().as_millis()
     );
 
     // 4) Establish TCP connection with retry.
@@ -396,7 +486,7 @@ pub fn start_scrcpy_and_connect(
     // causing an instant EOF. We detect this by peeking 1 byte — if it returns
     // 0 (EOF) we reconnect.
     let stream = {
-        let mut last_err: Option<String> = None;
+        let mut last_err: Option<String>;
         let start = std::time::Instant::now();
         loop {
             match TcpStream::connect(&addr) {
@@ -426,20 +516,23 @@ pub fn start_scrcpy_and_connect(
                 }
             }
             if start.elapsed() > Duration::from_secs(3) {
-                let _ = server_child.kill();
+                terminate_child(&mut server_child);
                 remove_forward(server_host, server_port, serial, actual_port);
+                clear_remote_server_verified(&remote_cache_key);
                 return Err(format!(
                     "tcp connect failed after retries: {}",
                     last_err.unwrap_or_else(|| "unknown".into())
                 ));
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(40));
         }
     };
 
     println!(
-        "[SCRCPY] tcp connected serial={} port={}",
-        serial, actual_port
+        "[SCRCPY] tcp connected serial={} port={} elapsed={}ms",
+        serial,
+        actual_port,
+        started_at.elapsed().as_millis()
     );
 
     stream.set_nodelay(true).ok();
@@ -450,16 +543,14 @@ pub fn start_scrcpy_and_connect(
     // 5) Connect control socket (second accept on the same abstract socket).
     //
     // The server blocks on controlSocket = localServerSocket.accept() right
-    // after the video accept. Give it a moment to set up the accept before
-    // we connect — racing the server can cause the TCP connect to succeed
-    // at the adb-forward layer without actually reaching the device.
-    std::thread::sleep(Duration::from_millis(100));
+    // after the video accept. The retry loop handles the short race where
+    // adb-forward accepts before the device-side control socket is ready.
     println!(
         "[SCRCPY] attempting control socket connect serial={} addr={}",
         serial, addr
     );
     let control = {
-        let mut last_err: Option<String> = None;
+        let mut last_err: Option<String>;
         let start = std::time::Instant::now();
         let mut ctrl: Option<TcpStream> = None;
         loop {
@@ -495,7 +586,7 @@ pub fn start_scrcpy_and_connect(
                 );
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            std::thread::sleep(Duration::from_millis(40));
         }
         ctrl
     };
@@ -506,8 +597,11 @@ pub fn start_scrcpy_and_connect(
         let local = c.local_addr().ok();
         let peer = c.peer_addr().ok();
         println!(
-            "[SCRCPY] control socket connected serial={} local={:?} peer={:?}",
-            serial, local, peer
+            "[SCRCPY] control socket connected serial={} local={:?} peer={:?} elapsed={}ms",
+            serial,
+            local,
+            peer,
+            started_at.elapsed().as_millis()
         );
     }
 

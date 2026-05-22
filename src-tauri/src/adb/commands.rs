@@ -60,7 +60,11 @@ fn run_adb_once(args: &[String], timeout: Duration) -> Result<AdbOutput, String>
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            Err(e) => return Err(format!("Failed to wait for adb: {}", e)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Failed to wait for adb: {}", e));
+            }
         }
     }
 }

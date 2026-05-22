@@ -5,7 +5,7 @@ use crate::adb::screenshot::ScreenshotTokens;
 use crate::adb::server::AdbServer;
 use crate::adb::stream::{ControlSockets, StreamTokens};
 
-pub const ADB_PERMITS: u32 = 4;
+pub const ADB_PERMITS: u32 = 8;
 
 pub struct AppState {
     pub servers: Arc<Mutex<Vec<AdbServer>>>,

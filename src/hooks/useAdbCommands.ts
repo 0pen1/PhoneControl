@@ -2,30 +2,29 @@ import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../store';
 import type { CommandResult, DeviceResolution, Device } from '../types';
 
-export function useAdbCommands() {
-  const selectedDevices = (primarySerial?: string): DeviceResolution[] => {
-    const { devices, selectedSerials } = useStore.getState();
-    const serials = devices
-      .filter((d) => selectedSerials.has(d.serial) && d.status === 'online')
-      .map((d) => ({
-        serial: d.serial,
-        width: d.screen_width,
-        height: d.screen_height,
-        server_host: d.server_host,
-        server_port: d.server_port,
-      }));
+const selectedDevices = (primarySerial?: string): DeviceResolution[] => {
+  const { devices, selectedSerials } = useStore.getState();
+  const serials = devices
+    .filter((d) => selectedSerials.has(d.serial) && d.status === 'online')
+    .map((d) => ({
+      serial: d.serial,
+      width: d.screen_width,
+      height: d.screen_height,
+      server_host: d.server_host,
+      server_port: d.server_port,
+    }));
 
-    if (!primarySerial) return serials;
+  if (!primarySerial) return serials;
 
-    const idx = serials.findIndex((d) => d.serial === primarySerial);
-    if (idx <= 0) return serials;
+  const idx = serials.findIndex((d) => d.serial === primarySerial);
+  if (idx <= 0) return serials;
 
-    const [primary] = serials.splice(idx, 1);
-    serials.unshift(primary);
-    return serials;
-  };
+  const [primary] = serials.splice(idx, 1);
+  serials.unshift(primary);
+  return serials;
+};
 
-  return {
+const adbCommands = {
     async tapDevices(x: number, y: number, sourceWidth: number, sourceHeight: number, primarySerial?: string): Promise<CommandResult[]> {
       const serials = selectedDevices(primarySerial);
       return invoke<CommandResult[]>('tap_devices', { serials, x, y, sourceWidth, sourceHeight });
@@ -158,5 +157,8 @@ export function useAdbCommands() {
     async wakeUpDevices(serials: DeviceResolution[]): Promise<CommandResult[]> {
       return invoke<CommandResult[]>('wake_up_devices', { serials });
     },
-  };
+};
+
+export function useAdbCommands() {
+  return adbCommands;
 }

@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter};
+use tokio::io::AsyncReadExt;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
@@ -56,6 +57,14 @@ pub async fn stop_screenshot_loop(tokens: ScreenshotTokens, serial: &str) {
 }
 
 async fn capture_screenshot(serial: &str, host: &str, port: u16) -> Option<String> {
+    let png_data = capture_screenshot_png(serial, host, port).await?;
+    tokio::task::spawn_blocking(move || encode_screenshot_jpeg(png_data))
+        .await
+        .ok()
+        .flatten()
+}
+
+async fn capture_screenshot_png(serial: &str, host: &str, port: u16) -> Option<Vec<u8>> {
     let mut args = server_args(host, port);
     args.extend([
         "-s".into(),
@@ -65,17 +74,40 @@ async fn capture_screenshot(serial: &str, host: &str, port: u16) -> Option<Strin
         "-p".into(),
     ]);
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        tokio::process::Command::new("adb").args(&args).output(),
-    )
-    .await;
+    let mut child = tokio::process::Command::new("adb")
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
 
-    let png_data = match result {
-        Ok(Ok(out)) if out.status.success() && !out.stdout.is_empty() => out.stdout,
-        _ => return None,
+    let mut stdout = child.stdout.take()?;
+    let stdout_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        stdout.read_to_end(&mut buf).await.ok()?;
+        Some(buf)
+    });
+
+    let status = match tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+        Ok(Ok(status)) => status,
+        _ => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            let _ = stdout_task.await;
+            return None;
+        }
     };
 
+    let stdout = stdout_task.await.ok().flatten()?;
+    if status.success() && !stdout.is_empty() {
+        Some(stdout)
+    } else {
+        None
+    }
+}
+
+fn encode_screenshot_jpeg(png_data: Vec<u8>) -> Option<String> {
     // Decode PNG, scale down, re-encode as JPEG (~30-60KB vs ~2MB PNG)
     let img = image::load_from_memory(&png_data).ok()?;
     let thumb = img.thumbnail(360, 640);
