@@ -97,9 +97,10 @@ describe('useStream', () => {
     vi.useRealTimers();
   });
 
-  it('opens exactly one WebSocket on mount', () => {
+  it('opens one WebSocket per desired device', () => {
+    useStore.setState({ devices: [device('a'), device('b')] });
     renderHook(() => useStream());
-    expect(instances.length).toBe(1);
+    expect(instances.length).toBe(2);
     expect(instances[0].url).toBe('ws://127.0.0.1:32199');
     expect(instances[0].binaryType).toBe('arraybuffer');
   });
@@ -117,6 +118,7 @@ describe('useStream', () => {
   });
 
   it('does not re-open WebSocket when fps changes', () => {
+    useStore.setState({ devices: [device('a')] });
     const { rerender } = renderHook(() => useStream());
     act(() => { instances[0]._open(); });
     expect(instances.length).toBe(1);
@@ -126,7 +128,7 @@ describe('useStream', () => {
     expect(instances.length).toBe(1);
   });
 
-  it('does not re-open WebSocket when devices change, only sends subscribe/unsubscribe', () => {
+  it('opens and closes sockets as devices change', () => {
     useStore.setState({ devices: [device('a')] });
     renderHook(() => useStream());
     act(() => { instances[0]._open(); });
@@ -136,21 +138,22 @@ describe('useStream', () => {
 
     // Add device b
     act(() => { useStore.setState({ devices: [device('a'), device('b')] }); });
-    expect(instances.length).toBe(1);
-    expect(instances[0].sent).toContain(JSON.stringify({ type: 'subscribe', serial: 'b' }));
+    expect(instances.length).toBe(2);
+    act(() => { instances[1]._open(); });
+    expect(instances[1].sent).toContain(JSON.stringify({ type: 'subscribe', serial: 'b' }));
 
     // Remove device a
     act(() => { useStore.setState({ devices: [device('b')] }); });
-    expect(instances[0].sent).toContain(JSON.stringify({ type: 'unsubscribe', serial: 'a' }));
+    expect(instances[0].readyState).toBe(CLOSED);
   });
 
-  it('sends unsubscribe when a device is disabled', () => {
+  it('closes the device socket when a device is disabled', () => {
     useStore.setState({ devices: [device('a'), device('b')] });
     renderHook(() => useStream());
     act(() => { instances[0]._open(); });
 
     act(() => { useStore.setState({ disabledSerials: new Set(['a']) }); });
-    expect(instances[0].sent).toContain(JSON.stringify({ type: 'unsubscribe', serial: 'a' }));
+    expect(instances[0].readyState).toBe(CLOSED);
   });
 
   it('reconnects after the server drops the connection', () => {
@@ -173,6 +176,7 @@ describe('useStream', () => {
   });
 
   it('backs off exponentially on repeated failures', () => {
+    useStore.setState({ devices: [device('a')] });
     renderHook(() => useStream());
     // 1st close → ~200ms
     act(() => { instances[0]._serverClose(); });
@@ -190,6 +194,7 @@ describe('useStream', () => {
   });
 
   it('does not reconnect after unmount', () => {
+    useStore.setState({ devices: [device('a')] });
     const { unmount } = renderHook(() => useStream());
     unmount();
     act(() => { vi.advanceTimersByTime(10_000); });

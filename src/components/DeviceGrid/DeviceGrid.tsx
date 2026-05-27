@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState, useCallback, useMemo } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { useStore } from '../../store';
 import { useAdbCommands } from '../../hooks/useAdbCommands';
 import { DeviceCard } from './DeviceCard';
@@ -11,50 +10,70 @@ const FIXED_HEADER_HEIGHT = 33;
 const FIXED_FOOTER_HEIGHT = 30;
 const GRID_GAP = 10;
 const GRID_PADDING = 12;
+const GRID_FIT_SAFETY = 8;
+const OVERVIEW_FIT_SAFETY = 14;
 const PREFETCH_PAGE_RADIUS = 1;
-const STREAM_START_BATCH_SIZE = 2;
-const STREAM_START_BATCH_GAP_MS = 180;
-const BACKGROUND_STREAM_DELAY_MS = 1000;
+const STREAM_START_BATCH_SIZE = 8;
+const STREAM_START_BATCH_GAP_MS = 25;
+const BACKGROUND_STREAM_DELAY_MS = 600;
+const NATURAL_LAYOUT_MIN_SCALE_RATIO = 0.82;
+
+function deviceStreamKey(d: { serial: string; server_host: string; server_port: number }) {
+  return `${d.server_host}:${d.server_port}:${d.serial}`;
+}
 
 function streamOptionsFor(count: number, overviewMode: boolean, fps: number) {
   if (overviewMode || count > 20) {
     return {
-      max_size: 360,
-      max_fps: Math.max(1, Math.min(fps, 2)),
-      bit_rate: 400_000,
+      max_size: 480,
+      max_fps: Math.max(3, Math.min(fps, 5)),
+      bit_rate: 900_000,
     };
   }
   if (count > 12) {
     return {
-      max_size: 480,
-      max_fps: Math.max(1, Math.min(fps, 4)),
-      bit_rate: 900_000,
+      max_size: 540,
+      max_fps: Math.max(3, Math.min(fps, 8)),
+      bit_rate: 1_400_000,
     };
   }
   return { max_size: 720, max_fps: fps, bit_rate: 4_000_000 };
 }
 
-function useAutoScale(
+function useCardLayout(
   containerRef: React.RefObject<HTMLDivElement | null>,
   count: number,
+  overviewMode: boolean,
 ) {
   const [scale, setScale] = useState(1);
+  const [columns, setColumns] = useState(1);
 
   const calcScale = useCallback(() => {
     if (count === 0 || !containerRef.current) {
       setScale(1);
+      setColumns(1);
       return;
     }
     const rect = containerRef.current.getBoundingClientRect();
-    const availW = rect.width - GRID_PADDING * 2;
-    const availH = rect.height - GRID_PADDING * 2;
+    const availW = rect.width - GRID_PADDING * 2 - GRID_FIT_SAFETY;
+    const availH =
+      rect.height
+      - GRID_PADDING * 2
+      - GRID_FIT_SAFETY
+      - (overviewMode ? OVERVIEW_FIT_SAFETY : 0);
     if (availW <= 0 || availH <= 0) return;
 
-    // Try different column counts, pick the one that uses the largest scale
-    // while fitting all cards without overflow.
-    // Card width = SCREEN_BASE_HEIGHT * scale * SCREEN_ASPECT
-    // Card height = FIXED_HEADER_HEIGHT + SCREEN_BASE_HEIGHT * scale + FIXED_FOOTER_HEIGHT
-    let best = 0;
+    let maxScale = 0;
+    const candidates: Array<{
+      cols: number;
+      rows: number;
+      scale: number;
+      widthUse: number;
+      heightUse: number;
+      areaUse: number;
+      lastRowFill: number;
+    }> = [];
+
     for (let cols = 1; cols <= count; cols++) {
       const rows = Math.ceil(count / cols);
       const maxCardW = (availW - GRID_GAP * (cols - 1)) / cols;
@@ -66,10 +85,46 @@ function useAutoScale(
       const screenH = Math.min(maxScreenFromW, maxScreenFromH);
       if (screenH <= 0) continue;
       const s = screenH / SCREEN_BASE_HEIGHT;
-      if (s > best) best = s;
+      const cardW = screenH * SCREEN_ASPECT;
+      const cardH = FIXED_HEADER_HEIGHT + screenH + FIXED_FOOTER_HEIGHT;
+      const usedW = cardW * cols + GRID_GAP * (cols - 1);
+      const usedH = cardH * rows + GRID_GAP * (rows - 1);
+      const widthUse = Math.min(1, usedW / availW);
+      const heightUse = Math.min(1, usedH / availH);
+      const lastRow = count % cols || cols;
+      maxScale = Math.max(maxScale, s);
+      candidates.push({
+        cols,
+        rows,
+        scale: s,
+        widthUse,
+        heightUse,
+        areaUse: widthUse * heightUse,
+        lastRowFill: lastRow / cols,
+      });
     }
-    setScale(Math.max(best, 0.1));
-  }, [count, containerRef]);
+
+    const minNaturalScale = maxScale * NATURAL_LAYOUT_MIN_SCALE_RATIO;
+    const best = candidates
+      .filter((c) => c.scale >= minNaturalScale)
+      .sort((a, b) => {
+        const score = (c: typeof a) => {
+          const sparsePenalty = c.lastRowFill < 0.6 ? (0.6 - c.lastRowFill) * 3 : 0;
+          return (
+            c.areaUse * 4
+            + c.widthUse * 0.7
+            + c.heightUse * 0.7
+            + c.lastRowFill * 0.6
+            + (c.scale / maxScale) * 1.2
+            - sparsePenalty
+          );
+        };
+        return score(b) - score(a);
+      })[0] ?? candidates[0];
+
+    setScale(Math.max(best?.scale ?? 1, 0.1));
+    setColumns(best?.cols ?? 1);
+  }, [count, containerRef, overviewMode]);
 
   useEffect(() => {
     calcScale();
@@ -78,14 +133,13 @@ function useAutoScale(
     return () => ro.disconnect();
   }, [calcScale, containerRef]);
 
-  return scale;
+  return { scale, columns };
 }
 
 export function DeviceGrid() {
   const devices = useStore((s) => s.devices);
   const disabledSerials = useStore((s) => s.disabledSerials);
   const selectedSerials = useStore((s) => s.selectedSerials);
-  const screenshots = useStore((s) => s.screenshots);
   const page = useStore((s) => s.page);
   const pageSize = useStore((s) => s.pageSize);
   const setPage = useStore((s) => s.setPage);
@@ -104,7 +158,7 @@ export function DeviceGrid() {
 
   const gridRef = useRef<HTMLDivElement>(null);
   const scaleCount = overviewMode ? enabledDevices.length : pageDevices.length;
-  const scale = useAutoScale(gridRef, scaleCount);
+  const { scale, columns } = useCardLayout(gridRef, scaleCount, overviewMode);
   const enabledOnlineDevices = enabledDevices.filter((d) => d.status === 'online');
   const currentOnlineDevices = pageDevices.filter((d) => d.status === 'online');
   const activeStreamCount = overviewMode
@@ -116,10 +170,20 @@ export function DeviceGrid() {
   );
 
   // Track streams that have actually been started and kept warm.
-  const warmedSerialsRef = useRef<Set<string>>(new Set());
+  const warmedStreamsRef = useRef<Map<string, string>>(new Map());
 
   useEffect(() => {
-    const currentSerialSet = new Set(currentOnlineDevices.map((d) => d.serial));
+    return () => {
+      for (const [key, serial] of warmedStreamsRef.current) {
+        const [serverHost, serverPort] = key.split(':');
+        cmds.stopStream(serial, serverHost, Number(serverPort)).catch(() => {});
+      }
+      warmedStreamsRef.current.clear();
+    };
+  }, [cmds]);
+
+  useEffect(() => {
+    const currentStreamKeySet = new Set(currentOnlineDevices.map(deviceStreamKey));
     const prefetchDevices = overviewMode
       ? []
       : enabledDevices
@@ -127,38 +191,35 @@ export function DeviceGrid() {
             Math.max(0, (page - PREFETCH_PAGE_RADIUS) * pageSize),
             Math.min(enabledDevices.length, (page + PREFETCH_PAGE_RADIUS + 1) * pageSize),
           )
-          .filter((d) => d.status === 'online' && !currentSerialSet.has(d.serial));
+          .filter((d) => d.status === 'online' && !currentStreamKeySet.has(deviceStreamKey(d)));
     const backgroundDevices = prefetchDevices;
     const targetDevices = [...currentOnlineDevices, ...backgroundDevices];
-    const currentSerials = new Set(targetDevices.map((d) => d.serial));
-    const warmed = warmedSerialsRef.current;
+    const currentStreamKeys = new Set(targetDevices.map(deviceStreamKey));
+    const warmed = warmedStreamsRef.current;
     let cancelled = false;
     const startTimers: number[] = [];
 
     // Stop streams only when the device is no longer eligible. Pagination
     // should not tear down scrcpy; it only changes the WS subscription.
-    for (const serial of Array.from(warmed)) {
-      if (!currentSerials.has(serial)) {
-        invoke('stop_stream', { serial }).catch(() => {});
-        warmed.delete(serial);
+    for (const [key, serial] of Array.from(warmed)) {
+      if (!currentStreamKeys.has(key)) {
+        const [serverHost, serverPort] = key.split(':');
+        cmds.stopStream(serial, serverHost, Number(serverPort)).catch(() => {});
+        warmed.delete(key);
       }
     }
 
     const startDevice = (d: typeof targetDevices[number]) => {
-      if (warmedSerialsRef.current.has(d.serial)) return;
-      warmedSerialsRef.current.add(d.serial);
-      invoke('start_stream', {
-        serial: d.serial,
-        serverHost: d.server_host,
-        serverPort: d.server_port,
-        options: streamOptions,
-      }).catch(() => {
-        warmedSerialsRef.current.delete(d.serial);
+      const key = deviceStreamKey(d);
+      if (warmedStreamsRef.current.has(key)) return;
+      warmedStreamsRef.current.set(key, d.serial);
+      cmds.startStream(d.serial, d.server_host, d.server_port, streamOptions).catch(() => {
+        warmedStreamsRef.current.delete(key);
       });
     };
 
-    const newCurrentDevices = currentOnlineDevices.filter((d) => !warmed.has(d.serial));
-    const newBackgroundDevices = backgroundDevices.filter((d) => !warmed.has(d.serial));
+    const newCurrentDevices = currentOnlineDevices.filter((d) => !warmed.has(deviceStreamKey(d)));
+    const newBackgroundDevices = backgroundDevices.filter((d) => !warmed.has(deviceStreamKey(d)));
 
     const scheduleStarts = (
       devicesToStart: typeof targetDevices,
@@ -200,14 +261,14 @@ export function DeviceGrid() {
   }, [
     page,
     overviewMode,
-    enabledDevices.map((d) => `${d.serial}:${d.status}`).join(','),
+    enabledDevices.map((d) => `${deviceStreamKey(d)}:${d.status}`).join(','),
     fps,
     pageSize,
     streamOptions.max_size,
     streamOptions.max_fps,
     streamOptions.bit_rate,
     cmds,
-    currentOnlineDevices.map((d) => d.serial).join(','),
+    currentOnlineDevices.map(deviceStreamKey).join(','),
   ]);
 
   if (devices.length === 0) {
@@ -221,13 +282,14 @@ export function DeviceGrid() {
   }
 
   const screenH = SCREEN_BASE_HEIGHT * scale;
-  const cardW = Math.round(screenH * SCREEN_ASPECT);
+  const cardW = Math.floor(screenH * SCREEN_ASPECT);
   const cardTotalH = FIXED_HEADER_HEIGHT + screenH + FIXED_FOOTER_HEIGHT;
 
-  const cardStyle = {
+  const gridStyle = {
     '--card-width': `${cardW}px`,
     '--card-height': `${screenH}px`,
     '--card-total-height': `${cardTotalH}px`,
+    '--grid-columns': columns,
     fontSize: `${scale * 100}%`,
   } as React.CSSProperties;
 
@@ -236,12 +298,12 @@ export function DeviceGrid() {
       <div
         ref={gridRef}
         className={`${styles.grid} ${overviewMode ? styles.gridOverview : ''}`}
+        style={gridStyle}
       >
         {pageDevices.map((device) => (
-          <div key={device.serial} style={cardStyle}>
+          <div key={device.serial}>
             <DeviceCard
               device={device}
-              screenshot={screenshots[device.serial]}
               selected={selectedSerials.has(device.serial)}
             />
           </div>

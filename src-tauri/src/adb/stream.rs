@@ -1,4 +1,11 @@
-use std::{io::Read, sync::Arc};
+use std::{
+    collections::HashSet,
+    io::Read,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 use tauri::Manager;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{Mutex, Semaphore};
@@ -62,7 +69,17 @@ fn reconnect_delay_ms(
     raw_delay.min(MAX_RECONNECT_SLEEP_MS)
 }
 
-pub type StreamTokens = Arc<Mutex<std::collections::HashMap<String, CancellationToken>>>;
+pub struct StreamTokenEntry {
+    token: CancellationToken,
+    session_id: u64,
+    host: String,
+    port: u16,
+    clients: HashSet<String>,
+}
+
+pub type StreamTokens = Arc<Mutex<std::collections::HashMap<String, StreamTokenEntry>>>;
+static NEXT_STREAM_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct ControlEntry {
     pub stream: std::net::TcpStream,
     pub video_width: u32,
@@ -90,10 +107,31 @@ fn remove_control_socket(control_sockets: &ControlSockets, serial: &str, reason:
     }
 }
 
-fn emit_stream_status(app: &AppHandle, serial: &str, status: &str, error: Option<&str>) {
+fn emit_stream_status(
+    app: &AppHandle,
+    serial: &str,
+    host: &str,
+    port: u16,
+    session_id: u64,
+    status: &str,
+    error: Option<&str>,
+) {
     let payload = match error {
-        Some(error) => serde_json::json!({"serial": serial, "status": status, "error": error}),
-        None => serde_json::json!({"serial": serial, "status": status}),
+        Some(error) => serde_json::json!({
+            "serial": serial,
+            "serverHost": host,
+            "serverPort": port,
+            "sessionId": session_id,
+            "status": status,
+            "error": error,
+        }),
+        None => serde_json::json!({
+            "serial": serial,
+            "serverHost": host,
+            "serverPort": port,
+            "sessionId": session_id,
+            "status": status,
+        }),
     };
     let _ = app.emit("stream-status", payload);
 }
@@ -125,11 +163,11 @@ fn reconnect_jitter_ms(serial: &str, modulo: u64) -> u64 {
 
 /// Start a scrcpy-based video stream.
 ///
-/// This currently records to stdout as an MKV stream, then decodes frames and emits JPEG data.
+/// This connects to the scrcpy server and forwards raw H.264 packets to the local WebSocket hub.
 ///
 /// Notes:
 /// - Control is intentionally disabled (Phase 1).
-/// - For simplicity, we emit JPEG base64 via a Tauri event; this can later be optimized to binary.
+/// - The frontend decodes with WebCodecs and paints directly into per-device canvases.
 pub async fn start_stream_loop(
     tokens: StreamTokens,
     control_sockets: ControlSockets,
@@ -138,18 +176,52 @@ pub async fn start_stream_loop(
     host: String,
     port: u16,
     opts: StreamOptions,
+    client_id: String,
     app: AppHandle,
 ) {
     println!(
-        "[STREAM] start_stream_loop serial={} server={}:{} opts={{max_size={}, max_fps={}, bit_rate={}}}",
-        serial, host, port, opts.max_size, opts.max_fps, opts.bit_rate
+        "[STREAM] start_stream_loop serial={} server={}:{} client={} opts={{max_size={}, max_fps={}, bit_rate={}}}",
+        serial, host, port, client_id, opts.max_size, opts.max_fps, opts.bit_rate
     );
     let token = CancellationToken::new();
+    let session_id = NEXT_STREAM_SESSION_ID.fetch_add(1, Ordering::Relaxed);
     {
         let mut map = tokens.lock().await;
-        if let Some(old) = map.insert(serial.clone(), token.clone()) {
-            old.cancel();
+        if let Some(existing) = map.get_mut(&serial) {
+            if existing.host == host && existing.port == port && !existing.token.is_cancelled() {
+                let inserted = existing.clients.insert(client_id.clone());
+                println!(
+                    "[STREAM] reuse existing stream serial={} server={}:{} client={} inserted={} clients={}",
+                    serial,
+                    host,
+                    port,
+                    client_id,
+                    inserted,
+                    existing.clients.len()
+                );
+                return;
+            }
+            if let Some(old) = map.remove(&serial) {
+                println!(
+                    "[STREAM] replacing stream serial={} old={}:{} new={}:{}",
+                    serial, old.host, old.port, host, port
+                );
+                old.token.cancel();
+            }
         }
+
+        let mut clients = HashSet::new();
+        clients.insert(client_id);
+        map.insert(
+            serial.clone(),
+            StreamTokenEntry {
+                token: token.clone(),
+                session_id,
+                host: host.clone(),
+                port,
+                clients,
+            },
+        );
     }
 
     // Backoff for connection-attempt failures. Large batches can make many
@@ -173,10 +245,7 @@ pub async fn start_stream_loop(
         } else {
             "reconnecting"
         };
-        let _ = app.emit(
-            "stream-status",
-            serde_json::json!({"serial": serial, "status": status_label}),
-        );
+        emit_stream_status(&app, &serial, &host, port, session_id, status_label, None);
         if !first_run {
             println!(
                 "[STREAM] reconnecting serial={} attempt={}",
@@ -220,9 +289,14 @@ pub async fn start_stream_loop(
             Ok(Err(e)) => {
                 println!("[STREAM] connect failed serial={}: {}", serial, e);
                 let device_not_found = e.contains("device") && e.contains("not found");
-                let _ = app.emit(
-                    "stream-status",
-                    serde_json::json!({"serial": serial, "status": "reconnecting", "error": e}),
+                emit_stream_status(
+                    &app,
+                    &serial,
+                    &host,
+                    port,
+                    session_id,
+                    "reconnecting",
+                    Some(&e),
                 );
                 attempt += 1;
                 let recent_stream_drop = fast_retry_until
@@ -261,10 +335,7 @@ pub async fn start_stream_loop(
             }
         };
 
-        let _ = app.emit(
-            "stream-status",
-            serde_json::json!({"serial": serial, "status": "connected"}),
-        );
+        emit_stream_status(&app, &serial, &host, port, session_id, "connected", None);
         let connected_at = std::time::Instant::now();
         let stdout = scrcpy_conn.stream;
         let local_port = scrcpy_conn.local_port;
@@ -282,6 +353,7 @@ pub async fn start_stream_loop(
         }
 
         let serial_for_task = serial.clone();
+        let host_for_task = host.clone();
         let token_for_task = token.clone();
         let app_for_task = app.clone();
         let hub = app.state::<WsHub>().inner().clone();
@@ -291,6 +363,9 @@ pub async fn start_stream_loop(
                 forward_h264_to_ws(
                     stdout,
                     &serial_for_task,
+                    &host_for_task,
+                    port,
+                    session_id,
                     &token_for_task,
                     &app_for_task,
                     &hub,
@@ -303,13 +378,25 @@ pub async fn start_stream_loop(
                 Ok(Err(e)) => {
                     let _ = app_for_task.emit(
                         "stream-error",
-                        serde_json::json!({ "serial": &serial_for_task, "error": e }),
+                        serde_json::json!({
+                            "serial": &serial_for_task,
+                            "serverHost": &host_for_task,
+                            "serverPort": port,
+                            "sessionId": session_id,
+                            "error": e,
+                        }),
                     );
                 }
                 Err(_) => {
                     let _ = app_for_task.emit(
                         "stream-error",
-                        serde_json::json!({ "serial": &serial_for_task, "error": "panic in stream forward" }),
+                        serde_json::json!({
+                            "serial": &serial_for_task,
+                            "serverHost": &host_for_task,
+                            "serverPort": port,
+                            "sessionId": session_id,
+                            "error": "panic in stream forward",
+                        }),
                     );
                 }
             }
@@ -370,28 +457,90 @@ pub async fn start_stream_loop(
 
     // Final cleanup
     remove_control_socket(&control_sockets, &serial, "stream loop stopped");
-    tokens.lock().await.remove(&serial);
-    let _ = app.emit(
-        "stream-status",
-        serde_json::json!({"serial": serial, "status": "stopped"}),
-    );
+    let is_current_session = {
+        let mut map = tokens.lock().await;
+        match map.get(&serial) {
+            Some(entry) if entry.session_id == session_id => {
+                map.remove(&serial);
+                true
+            }
+            _ => false,
+        }
+    };
+    if is_current_session {
+        let _ = app.emit(
+            "stream-status",
+            serde_json::json!({
+                "serial": serial,
+                "serverHost": host,
+                "serverPort": port,
+                "sessionId": session_id,
+                "status": "stopped",
+            }),
+        );
+    }
 }
 
-pub async fn stop_stream_loop(tokens: StreamTokens, control_sockets: ControlSockets, serial: &str) {
-    remove_control_socket(&control_sockets, serial, "stop stream requested");
+pub async fn stop_stream_loop(
+    tokens: StreamTokens,
+    control_sockets: ControlSockets,
+    serial: &str,
+    host: Option<&str>,
+    port: Option<u16>,
+    client_id: Option<&str>,
+    force: bool,
+) {
     let mut map = tokens.lock().await;
-    if let Some(token) = map.remove(serial) {
-        token.cancel();
+    let Some(entry) = map.get_mut(serial) else {
+        return;
+    };
+    let source_matches =
+        host.is_none_or(|host| entry.host == host) && port.is_none_or(|port| entry.port == port);
+    if !source_matches {
+        return;
+    }
+
+    if force || client_id.is_none() {
+        if let Some(entry) = map.remove(serial) {
+            remove_control_socket(&control_sockets, serial, "stop stream requested");
+            println!(
+                "[STREAM] stop stream serial={} reason={} clients={}",
+                serial,
+                if force { "force" } else { "legacy" },
+                entry.clients.len()
+            );
+            entry.token.cancel();
+        }
+        return;
+    }
+
+    if let Some(client_id) = client_id {
+        entry.clients.remove(client_id);
+        println!(
+            "[STREAM] release stream lease serial={} client={} remaining={}",
+            serial,
+            client_id,
+            entry.clients.len()
+        );
+        if entry.clients.is_empty() {
+            if let Some(entry) = map.remove(serial) {
+                remove_control_socket(&control_sockets, serial, "last stream client released");
+                entry.token.cancel();
+            }
+        }
     }
 }
 
 /// Forward raw H.264 packets from the scrcpy stream to the WebSocket hub.
 ///
-/// Instead of decoding H.264 and re-encoding as JPEG, we send the raw NAL
-/// units to the frontend where WebCodecs `VideoDecoder` handles GPU decoding.
+/// Raw NAL units are sent to the frontend where WebCodecs `VideoDecoder`
+/// handles decoding.
 fn forward_h264_to_ws<R: Read + Send + 'static>(
     mut input: R,
     serial: &str,
+    host: &str,
+    port: u16,
+    session_id: u64,
     token: &CancellationToken,
     app: &AppHandle,
     hub: &WsHub,
@@ -409,6 +558,8 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
     let loop_start = std::time::Instant::now();
     let mut last_idle_log: Option<std::time::Instant> = None;
     let mut last_config: Option<Vec<u8>> = None;
+    let mut first_packet_forwarded = false;
+    let mut packet_seq: u64 = 0;
 
     println!("[SCRCPY-FWD] entering read loop serial={}", serial);
 
@@ -419,6 +570,9 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
                 emit_stream_status(
                     app,
                     serial,
+                    host,
+                    port,
+                    session_id,
                     "disconnected",
                     Some("video stream disconnected"),
                 );
@@ -450,7 +604,15 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
             }
             Err(e) => {
                 remove_control_socket(control_sockets, serial, "stream read error");
-                emit_stream_status(app, serial, "disconnected", Some("video stream read error"));
+                emit_stream_status(
+                    app,
+                    serial,
+                    host,
+                    port,
+                    session_id,
+                    "disconnected",
+                    Some("video stream read error"),
+                );
                 return Err(format!("read scrcpy stream failed: {e}"));
             }
         };
@@ -458,10 +620,6 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
         if first_data_at.is_none() {
             first_data_at = Some(std::time::Instant::now());
             println!("[SCRCPY-FWD] first bytes serial={} n={}", serial, n);
-            let _ = app.emit(
-                "stream-status",
-                serde_json::json!({"serial": serial, "status": "receiving"}),
-            );
         }
         buf.extend_from_slice(&chunk[..n]);
 
@@ -538,8 +696,17 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
             if is_config {
                 // Config packet — cache and forward as type 0
                 last_config = Some(nal_data.to_vec());
-                let packed =
-                    WsHub::pack_h264_frame(serial, 0, pts, video_width, video_height, nal_data);
+                let seq = packet_seq;
+                packet_seq = packet_seq.wrapping_add(1);
+                let packed = WsHub::pack_h264_frame(
+                    serial,
+                    0,
+                    seq,
+                    pts,
+                    video_width,
+                    video_height,
+                    nal_data,
+                );
                 hub.broadcast(serial, packed);
             } else {
                 let packet_type = if is_key { 1u8 } else { 2 };
@@ -548,20 +715,45 @@ fn forward_h264_to_ws<R: Read + Send + 'static>(
                 // initial config packet due to late WS subscription.
                 if is_key {
                     if let Some(ref cfg) = last_config {
-                        let packed =
-                            WsHub::pack_h264_frame(serial, 0, pts, video_width, video_height, cfg);
+                        let seq = packet_seq;
+                        packet_seq = packet_seq.wrapping_add(1);
+                        let packed = WsHub::pack_h264_frame(
+                            serial,
+                            0,
+                            seq,
+                            pts,
+                            video_width,
+                            video_height,
+                            cfg,
+                        );
                         hub.broadcast(serial, packed);
                     }
                 }
+                let seq = packet_seq;
+                packet_seq = packet_seq.wrapping_add(1);
                 let packed = WsHub::pack_h264_frame(
                     serial,
                     packet_type,
+                    seq,
                     pts,
                     video_width,
                     video_height,
                     nal_data,
                 );
                 hub.broadcast(serial, packed);
+                if !first_packet_forwarded {
+                    first_packet_forwarded = true;
+                    let _ = app.emit(
+                        "stream-status",
+                        serde_json::json!({
+                            "serial": serial,
+                            "serverHost": host,
+                            "serverPort": port,
+                            "sessionId": session_id,
+                            "status": "receiving",
+                        }),
+                    );
+                }
             }
 
             buf.drain(..12 + packet_size);

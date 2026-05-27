@@ -1,6 +1,7 @@
 .card {
   width: var(--card-width);
   height: var(--card-total-height);
+  box-sizing: border-box;
   background: var(--bg-card);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -21,7 +22,10 @@
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 8px 10px;
+  flex: 0 0 33px;
+  height: 33px;
+  padding: 0 10px;
+  box-sizing: border-box;
   cursor: pointer;
   background: var(--bg-secondary);
 }
@@ -103,7 +107,10 @@
 .footer {
   display: flex;
   align-items: center;
-  padding: 5px 10px;
+  flex: 0 0 30px;
+  height: 30px;
+  padding: 0 10px;
+  box-sizing: border-box;
   background: var(--bg-secondary);
   gap: 6px;
 }

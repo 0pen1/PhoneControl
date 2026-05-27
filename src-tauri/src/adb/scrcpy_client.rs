@@ -37,13 +37,13 @@ pub(crate) fn build_start_argv(
         format!("scid={scid:08x}"),
         "log_level=info".into(),
         "audio=false".into(),
-        "control=true".into(),
+        "control=false".into(),
         "tunnel_forward=true".into(),
         "stay_awake=true".into(),
         format!("max_size={}", opts.max_size),
         format!("max_fps={}", opts.max_fps),
         format!("video_bit_rate={}", opts.bit_rate),
-        "video_codec_options=i-frame-interval=2".into(),
+        "video_codec_options=i-frame-interval=1".into(),
         "send_device_meta=false".into(),
         "send_codec_meta=true".into(),
         "send_dummy_byte=true".into(),
@@ -67,6 +67,7 @@ pub(crate) fn build_start_cmd(
 ///
 /// Range `32200..=39999` gives 7800 ports. Birthday-problem collision
 /// probability at 100 devices ≈ 0.6%, vs ~50% with the old 800-port range.
+#[cfg(test)]
 pub(crate) fn scrcpy_local_port(serial: &str) -> u16 {
     32200 + (fxhash::hash64(serial) % 7800) as u16
 }
@@ -195,11 +196,7 @@ fn clear_remote_server_verified(key: &str) {
 
 /// Minimal scrcpy bootstrapper.
 ///
-/// Phase 1 goal: establish a TCP connection to scrcpy server and read some bytes.
-///
-/// We intentionally do not implement the full protocol yet (device name, codec meta, control
-/// channel, etc.). We use the official `scrcpy-server` artifact already shipped with the
-/// installed scrcpy client, pushed to the device and started via `app_process`.
+/// Minimal scrcpy bootstrapper for embedded video preview.
 pub struct ScrcpyConnection {
     pub serial: String,
     pub local_port: u16,
@@ -401,7 +398,6 @@ pub fn start_scrcpy_and_connect(
         (h.finish() as u32) & 0x7FFF_FFFF
     };
     // Note: args are key=value pairs, order irrelevant.
-    // We disable audio and control (Phase 1).
     let start_argv = build_start_argv(remote_path, &ver, scid, opts);
 
     // IMPORTANT: Keep the server process alive.
@@ -540,70 +536,10 @@ pub fn start_scrcpy_and_connect(
         .set_read_timeout(Some(Duration::from_millis(500)))
         .ok();
 
-    // 5) Connect control socket (second accept on the same abstract socket).
-    //
-    // The server blocks on controlSocket = localServerSocket.accept() right
-    // after the video accept. The retry loop handles the short race where
-    // adb-forward accepts before the device-side control socket is ready.
-    println!(
-        "[SCRCPY] attempting control socket connect serial={} addr={}",
-        serial, addr
-    );
-    let control = {
-        let mut last_err: Option<String>;
-        let start = std::time::Instant::now();
-        let mut ctrl: Option<TcpStream> = None;
-        loop {
-            match TcpStream::connect(&addr) {
-                Ok(s) => {
-                    // The control socket does NOT receive a dummy byte —
-                    // only the first accepted socket (video) does. Just
-                    // verify the connection is alive; EOF = server hasn't
-                    // accepted yet.
-                    s.set_read_timeout(Some(Duration::from_millis(500))).ok();
-                    let mut peek = [0u8; 1];
-                    match s.peek(&mut peek) {
-                        Ok(0) => {
-                            last_err = Some("control: immediate EOF".into());
-                        }
-                        _ => {
-                            // Any non-EOF (data, timeout, WouldBlock) means
-                            // the connection is alive. Do NOT read anything.
-                            ctrl = Some(s);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    last_err = Some(e.to_string());
-                }
-            }
-            if start.elapsed() > Duration::from_secs(3) {
-                println!(
-                    "[SCRCPY] control socket failed serial={}: {} (video-only mode)",
-                    serial,
-                    last_err.unwrap_or_else(|| "unknown".into())
-                );
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(40));
-        }
-        ctrl
-    };
-
-    if let Some(ref c) = control {
-        c.set_nodelay(true).ok();
-        c.set_write_timeout(Some(Duration::from_secs(2))).ok();
-        let local = c.local_addr().ok();
-        let peer = c.peer_addr().ok();
-        println!(
-            "[SCRCPY] control socket connected serial={} local={:?} peer={:?} elapsed={}ms",
-            serial,
-            local,
-            peer,
-            started_at.elapsed().as_millis()
-        );
-    }
+    // Embedded multi-device preview prioritizes video startup. scrcpy control
+    // requires a second socket accept; if that socket races or fails, some
+    // devices sit forever after the dummy byte without producing frames.
+    let control = None;
 
     // Keep the forward mapping for the whole scrcpy session, like the native
     // scrcpy client does. Removing it immediately leaves active connections
@@ -677,7 +613,7 @@ mod tests {
         assert!(cmd.contains("max_fps=30"));
         assert!(cmd.contains("video_bit_rate=4000000"));
         assert!(cmd.contains("audio=false"));
-        assert!(cmd.contains("control=true"));
+        assert!(cmd.contains("control=false"));
         assert!(cmd.contains("send_frame_meta=true"));
     }
 
@@ -751,7 +687,7 @@ mod tests {
 
         // Must NOT contain spaces in any single token (would indicate a joined blob).
         // Note: some scrcpy key=value args legitimately contain multiple '=' signs
-        // (e.g. "video_codec_options=i-frame-interval=2"), so we only check for spaces.
+        // (e.g. "video_codec_options=i-frame-interval=1"), so we only check for spaces.
         for token in &argv {
             assert!(
                 !token.contains(' '),
@@ -768,7 +704,7 @@ mod tests {
         assert!(argv.iter().any(|a| a == "scid=0000abcd"));
         assert!(argv.iter().any(|a| a == "tunnel_forward=true"));
         assert!(argv.iter().any(|a| a == "audio=false"));
-        assert!(argv.iter().any(|a| a == "control=true"));
+        assert!(argv.iter().any(|a| a == "control=false"));
         assert!(argv.iter().any(|a| a == "stay_awake=true"));
     }
 

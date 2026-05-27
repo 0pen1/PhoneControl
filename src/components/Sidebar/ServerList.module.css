@@ -10,12 +10,13 @@
   margin-bottom: 10px;
 }
 .addRow {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 56px 28px;
   gap: 6px;
   margin-bottom: 8px;
 }
 .input {
-  flex: 1;
+  min-width: 0;
   background: var(--bg-primary);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -23,7 +24,8 @@
   padding: 5px 8px;
 }
 .portInput {
-  width: 56px;
+  width: 100%;
+  min-width: 0;
   background: var(--bg-primary);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -35,6 +37,8 @@
   color: #fff;
   border-radius: var(--radius-sm);
   width: 28px;
+  min-width: 28px;
+  height: 28px;
   font-size: 18px;
   line-height: 1;
   display: flex;

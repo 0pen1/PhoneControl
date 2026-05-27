@@ -57,7 +57,9 @@ export function Toolbar() {
     );
     try {
       if (activeStreams.length > 0) {
-        await Promise.allSettled(activeStreams.map((d) => cmds.stopStream(d.serial)));
+        await Promise.allSettled(
+          activeStreams.map((d) => cmds.stopStream(d.serial, d.server_host, d.server_port, true))
+        );
         await new Promise((resolve) => setTimeout(resolve, 800));
       }
 

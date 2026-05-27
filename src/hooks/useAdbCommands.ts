@@ -24,6 +24,17 @@ const selectedDevices = (primarySerial?: string): DeviceResolution[] => {
   return serials;
 };
 
+const STREAM_CLIENT_ID = (() => {
+  if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
+    return `webview-${crypto.randomUUID()}`;
+  }
+  return `webview-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+})();
+
+export function getStreamClientId() {
+  return STREAM_CLIENT_ID;
+}
+
 const adbCommands = {
     async tapDevices(x: number, y: number, sourceWidth: number, sourceHeight: number, primarySerial?: string): Promise<CommandResult[]> {
       const serials = selectedDevices(primarySerial);
@@ -106,18 +117,6 @@ const adbCommands = {
       return invoke<CommandResult[]>('set_usb_file_transfer_devices', { serials });
     },
 
-    startPreview(serial: string, fps: number, serverHost: string, serverPort: number) {
-      return invoke<void>('start_preview', { serial, fps, serverHost, serverPort });
-    },
-
-    stopPreview(serial: string) {
-      return invoke<void>('stop_preview', { serial });
-    },
-
-    setFps(serial: string, fps: number, serverHost: string, serverPort: number) {
-      return invoke<void>('set_fps', { serial, fps, serverHost, serverPort });
-    },
-
     startStream(
       serial: string,
       serverHost: string,
@@ -129,11 +128,18 @@ const adbCommands = {
         serverHost,
         serverPort,
         options: options ?? { max_size: 720, max_fps: 30, bit_rate: 4_000_000 },
+        clientId: STREAM_CLIENT_ID,
       });
     },
 
-    stopStream(serial: string) {
-      return invoke<void>('stop_stream', { serial });
+    stopStream(serial: string, serverHost?: string, serverPort?: number, force = false) {
+      return invoke<void>('stop_stream', {
+        serial,
+        serverHost,
+        serverPort,
+        clientId: STREAM_CLIENT_ID,
+        force,
+      });
     },
 
     launchScrcpy(serial: string, serverHost: string, serverPort: number) {

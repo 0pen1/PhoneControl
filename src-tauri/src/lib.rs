@@ -5,7 +5,6 @@ mod ws;
 
 use adb::commands::{keyevent, send_text, set_usb_file_transfer, wake_up_device, CommandResult};
 use adb::scrcpy_control;
-use adb::screenshot::{start_screenshot_loop, stop_screenshot_loop};
 use adb::server::{poll_all_servers, AdbServer};
 use adb::stream::{start_stream_loop, stop_stream_loop, StreamOptions};
 use config::{load_servers, save_servers, ServerConfig};
@@ -87,35 +86,6 @@ async fn get_servers(state: State<'_, AppState>) -> Result<Vec<AdbServer>, Strin
     Ok(state.servers.lock().await.clone())
 }
 
-// ── Preview ──────────────────────────────────────────────────────────────────
-
-#[tauri::command]
-async fn start_preview(
-    serial: String,
-    fps: u32,
-    server_host: String,
-    server_port: u16,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<(), String> {
-    let tokens = Arc::clone(&state.screenshot_tokens);
-    tauri::async_runtime::spawn(start_screenshot_loop(
-        tokens,
-        serial,
-        server_host,
-        server_port,
-        fps,
-        app,
-    ));
-    Ok(())
-}
-
-#[tauri::command]
-async fn stop_preview(serial: String, state: State<'_, AppState>) -> Result<(), String> {
-    stop_screenshot_loop(Arc::clone(&state.screenshot_tokens), &serial).await;
-    Ok(())
-}
-
 // ── Stream preview (scrcpy) ─────────────────────────────────────────────────
 
 #[tauri::command]
@@ -124,12 +94,14 @@ async fn start_stream(
     server_host: String,
     server_port: u16,
     options: Option<StreamOptions>,
+    client_id: Option<String>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
+    let client_id = client_id.unwrap_or_else(|| "__legacy__".to_string());
     println!(
-        "[CMD] start_stream serial={} server={}:{}",
-        serial, server_host, server_port
+        "[CMD] start_stream serial={} server={}:{} client={}",
+        serial, server_host, server_port, client_id
     );
     let tokens = Arc::clone(&state.stream_tokens);
     let control_sockets = Arc::clone(&state.control_sockets);
@@ -143,41 +115,31 @@ async fn start_stream(
         server_host,
         server_port,
         opts,
+        client_id,
         app,
     ));
     Ok(())
 }
 
 #[tauri::command]
-async fn stop_stream(serial: String, state: State<'_, AppState>) -> Result<(), String> {
+async fn stop_stream(
+    serial: String,
+    server_host: Option<String>,
+    server_port: Option<u16>,
+    client_id: Option<String>,
+    force: Option<bool>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     stop_stream_loop(
         Arc::clone(&state.stream_tokens),
         Arc::clone(&state.control_sockets),
         &serial,
+        server_host.as_deref(),
+        server_port,
+        client_id.as_deref(),
+        force.unwrap_or(false),
     )
     .await;
-    Ok(())
-}
-
-#[tauri::command]
-async fn set_fps(
-    serial: String,
-    fps: u32,
-    server_host: String,
-    server_port: u16,
-    state: State<'_, AppState>,
-    app: AppHandle,
-) -> Result<(), String> {
-    stop_screenshot_loop(Arc::clone(&state.screenshot_tokens), &serial).await;
-    let tokens = Arc::clone(&state.screenshot_tokens);
-    tauri::async_runtime::spawn(start_screenshot_loop(
-        tokens,
-        serial,
-        server_host,
-        server_port,
-        fps,
-        app,
-    ));
     Ok(())
 }
 
@@ -977,9 +939,6 @@ pub fn run() {
             remove_server,
             toggle_server,
             get_servers,
-            start_preview,
-            stop_preview,
-            set_fps,
             start_stream,
             stop_stream,
             tap_devices,

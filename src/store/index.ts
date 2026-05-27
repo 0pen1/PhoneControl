@@ -22,10 +22,6 @@ interface AppStore {
   selectAll: () => void;
   clearSelection: () => void;
 
-  // Screenshots: serial -> dataURL
-  screenshots: Record<string, string>;
-  setScreenshot: (serial: string, data: string) => void;
-
   // Stream status (scrcpy)
   streamHeartbeats: Record<string, number>;
   setStreamHeartbeat: (serial: string, bytes: number) => void;
@@ -96,10 +92,6 @@ export const useStore = create<AppStore>((set) => ({
       ),
     })),
   clearSelection: () => set({ selectedSerials: new Set() }),
-
-  screenshots: {},
-  setScreenshot: (serial, data) =>
-    set((s) => ({ screenshots: { ...s.screenshots, [serial]: data } })),
 
   streamHeartbeats: {},
   setStreamHeartbeat: (serial, bytes) =>

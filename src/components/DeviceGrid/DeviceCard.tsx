@@ -8,11 +8,10 @@ import styles from './DeviceCard.module.css';
 
 interface Props {
   device: Device;
-  screenshot: string | undefined;
   selected: boolean;
 }
 
-function DeviceCardInner({ device, screenshot, selected }: Props) {
+function DeviceCardInner({ device, selected }: Props) {
   const toggleSelect = useStore((s) => s.toggleSelect);
   const toggleDisableDevice = useStore((s) => s.toggleDisableDevice);
   const groupInputBusy = useStore((s) => s.groupInputBusy);
@@ -22,7 +21,6 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
   const cmds = useAdbCommands();
   const imgRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const imgElementRef = useRef<HTMLImageElement>(null);
   const [copied, setCopied] = useState(false);
   const [tapMarker, setTapMarker] = useState<{ x: number; y: number } | null>(null);
 
@@ -41,8 +39,6 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
     toggleSelect(device.serial);
   }, [device.serial, isOnline, toggleSelect]);
 
-  // Compute image-space coordinates from a mouse event on the screen div.
-  // Works with both <canvas> (stream) and <img> (screenshot fallback).
   const showTapMarker = useCallback((x: number, y: number) => {
     setTapMarker({ x, y });
     window.setTimeout(() => setTapMarker(null), 650);
@@ -62,15 +58,11 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
     let sourceWidth = rect.width;
     let sourceHeight = rect.height;
 
-    // Try canvas first (stream), then img (screenshot)
     let naturalW = 0;
     let naturalH = 0;
     if (canvasRef.current && canvasRef.current.width > 0 && canvasRef.current.height > 0) {
       naturalW = canvasRef.current.width;
       naturalH = canvasRef.current.height;
-    } else if (imgElementRef.current && imgElementRef.current.naturalWidth > 0 && imgElementRef.current.naturalHeight > 0) {
-      naturalW = imgElementRef.current.naturalWidth;
-      naturalH = imgElementRef.current.naturalHeight;
     }
 
     if (naturalW > 0 && naturalH > 0) {
@@ -136,9 +128,6 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
         if (canvasRef.current && canvasRef.current.width > 0 && canvasRef.current.height > 0) {
           naturalW = canvasRef.current.width;
           naturalH = canvasRef.current.height;
-        } else if (imgElementRef.current && imgElementRef.current.naturalWidth > 0 && imgElementRef.current.naturalHeight > 0) {
-          naturalW = imgElementRef.current.naturalWidth;
-          naturalH = imgElementRef.current.naturalHeight;
         }
 
         if (naturalW > 0 && naturalH > 0) {
@@ -222,9 +211,9 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
 
   const statusClass = styles[`status_${device.status}`] ?? styles.status_offline;
   const streamState = status?.status;
-  const streamUnavailable = !!streamState && streamState !== 'connected' && streamState !== 'receiving';
+  const streamUnavailable = streamState === 'disconnected' || streamState === 'stopped';
   const hasStream = !!frame && !streamUnavailable;
-  const showStreamStatus = streamUnavailable || (!hasStream && !screenshot);
+  const showStreamStatus = streamUnavailable || !hasStream;
   const streamStatusText = status?.error
     ? status.error
     : isOnline
@@ -266,22 +255,13 @@ function DeviceCardInner({ device, screenshot, selected }: Props) {
             style={{ left: tapMarker.x, top: tapMarker.y }}
           />
         )}
-        {/* Canvas for WebCodecs stream — always mounted for registration, hidden when no frames */}
+        {/* Canvas stays mounted so WebCodecs can paint as soon as the first frame arrives. */}
         <canvas
           ref={canvasRef}
           className={styles.img}
           style={{ display: hasStream ? 'block' : 'none', pointerEvents: 'none' }}
         />
-        {!hasStream && screenshot && !streamUnavailable ? (
-          <img
-            ref={imgElementRef}
-            src={screenshot}
-            className={styles.img}
-            alt="screen"
-            draggable={false}
-            style={{ pointerEvents: 'none' }}
-          />
-        ) : showStreamStatus ? (
+        {showStreamStatus ? (
           <div className={`${styles.placeholder} ${streamUnavailable ? styles.streamDisconnected : ''}`}>
             <div style={{ fontSize: 12, opacity: 0.85 }}>
               {status?.status ? `Stream: ${status.status}` : 'Stream: (none)'}

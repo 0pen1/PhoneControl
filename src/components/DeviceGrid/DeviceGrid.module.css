@@ -6,12 +6,16 @@
 }
 .grid {
   flex: 1;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(var(--grid-columns), var(--card-width));
+  grid-auto-rows: var(--card-total-height);
   gap: 10px;
   padding: 12px;
   align-content: flex-start;
+  justify-content: center;
   overflow-y: auto;
+  min-height: 0;
+  overscroll-behavior: contain;
 }
 .gridOverview {
   overflow: hidden;

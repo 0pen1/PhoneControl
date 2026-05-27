@@ -12,6 +12,10 @@ export const WS_URL = 'ws://127.0.0.1:32199';
 const MAX_RECONNECT_DELAY_MS = 5000;
 const BASE_RECONNECT_DELAY_MS = 200;
 
+function deviceStreamSource(d: { serial: string; server_host: string; server_port: number }) {
+  return `${d.server_host}:${d.server_port}:${d.serial}`;
+}
+
 interface DecoderState {
   decoder: VideoDecoder;
   configured: boolean;
@@ -21,11 +25,21 @@ interface DecoderState {
   lastConfig: VideoDecoderConfig | null;
   waitingForKeyframe: boolean;
   pendingFrame: VideoFrame | null;
+  lastSeq: bigint | null;
+}
+
+interface SocketState {
+  serial: string;
+  ws: WebSocket | null;
+  attempt: number;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
+  closed: boolean;
 }
 
 interface ParsedV3Frame {
   serial: string;
   packetType: number; // 0=config, 1=key, 2=delta
+  seq: bigint | null;
   pts: bigint;
   width: number;
   height: number;
@@ -36,16 +50,18 @@ export function parseV3Frame(buf: ArrayBuffer): ParsedV3Frame {
   const view = new DataView(buf);
   let off = 0;
   const version = view.getUint8(off); off += 1;
-  if (version !== 3) throw new Error(`Unsupported frame version: ${version}`);
+  if (version !== 3 && version !== 4) throw new Error(`Unsupported frame version: ${version}`);
   const serialLen = view.getUint16(off, false); off += 2;
   const serialBytes = new Uint8Array(buf, off, serialLen); off += serialLen;
   const serial = new TextDecoder().decode(serialBytes);
   const packetType = view.getUint8(off); off += 1;
+  const seq = version >= 4 ? view.getBigUint64(off, false) : null;
+  if (version >= 4) off += 8;
   const pts = view.getBigUint64(off, false); off += 8;
   const width = view.getUint32(off, false); off += 4;
   const height = view.getUint32(off, false); off += 4;
   const nalData = new Uint8Array(buf, off);
-  return { serial, packetType, pts, width, height, nalData };
+  return { serial, packetType, seq, pts, width, height, nalData };
 }
 
 export function useStream() {
@@ -69,13 +85,47 @@ export function useStream() {
   }, [devices, disabledSerials, page, pageSize, overviewMode]);
 
   const desiredRef = useRef<Set<string>>(desired);
-  const subscribedRef = useRef<Set<string>>(new Set());
-  const wsRef = useRef<WebSocket | null>(null);
+  const sourceBySerialRef = useRef<Map<string, string>>(new Map());
+  const socketsRef = useRef<Map<string, SocketState>>(new Map());
   const decodersRef = useRef<Map<string, DecoderState>>(new Map());
+  const connectSerialRef = useRef<((serial: string) => void) | null>(null);
+  const closeSerialRef = useRef<((serial: string) => void) | null>(null);
 
   useEffect(() => {
     desiredRef.current = desired;
-    reconcile(wsRef.current, subscribedRef.current, desired);
+    const nextSources = new Map(
+      devices
+        .filter((d) => d.status === 'online' && !disabledSerials.has(d.serial))
+        .map((d) => [d.serial, deviceStreamSource(d)]),
+    );
+
+    for (const serial of desired) {
+      const previousSource = sourceBySerialRef.current.get(serial);
+      const nextSource = nextSources.get(serial);
+      if (previousSource && nextSource && previousSource !== nextSource) {
+        closeSerialRef.current?.(serial);
+        const decoder = decodersRef.current.get(serial);
+        if (decoder?.pendingFrame) { decoder.pendingFrame.close(); decoder.pendingFrame = null; }
+        if (decoder && decoder.decoder.state !== 'closed') {
+          try { decoder.decoder.close(); } catch { /* noop */ }
+        }
+        decodersRef.current.delete(serial);
+        clearStreamFrame(serial);
+      }
+    }
+    sourceBySerialRef.current = nextSources;
+
+    for (const serial of Array.from(socketsRef.current.keys())) {
+      if (!desired.has(serial)) {
+        closeSerialRef.current?.(serial);
+      }
+    }
+    for (const serial of desired) {
+      if (!socketsRef.current.has(serial)) {
+        connectSerialRef.current?.(serial);
+      }
+    }
+
     for (const [serial, state] of decodersRef.current) {
       if (!desired.has(serial)) {
         if (state.pendingFrame) { state.pendingFrame.close(); state.pendingFrame = null; }
@@ -90,12 +140,9 @@ export function useStream() {
 
   useEffect(() => {
     let cancelled = false;
-    let attempt = 0;
-    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let rafId: number | null = null;
     const decoders = decodersRef.current;
 
-    // ---- rAF render loop: only draw the latest frame per device ----
     function renderLoop() {
       for (const [serial, state] of decoders) {
         const frame = state.pendingFrame;
@@ -128,7 +175,6 @@ export function useStream() {
     }
     rafId = requestAnimationFrame(renderLoop);
 
-    // ---- decoder management ----
     function getOrCreateDecoder(serial: string): DecoderState {
       let state = decoders.get(serial);
       if (state && state.decoder.state !== 'closed') return state;
@@ -137,83 +183,128 @@ export function useStream() {
         output: (frame) => {
           const s = decoders.get(serial);
           if (!s) { frame.close(); return; }
-          // Only keep the latest decoded frame — close any stale pending frame
           if (s.pendingFrame) s.pendingFrame.close();
           s.pendingFrame = frame;
         },
         error: (e) => {
           console.error(`[WebCodecs] decoder error serial=${serial}:`, e.message);
+          const current = decoders.get(serial);
+          if (current?.decoder === decoder) {
+            resetDecoder(serial);
+          }
         },
       });
 
       state = {
         decoder, configured: false, ctx: null,
         lastWidth: 0, lastHeight: 0, lastConfig: null,
-        waitingForKeyframe: false, pendingFrame: null,
+        waitingForKeyframe: false, pendingFrame: null, lastSeq: null,
       };
       decoders.set(serial, state);
       return state;
     }
 
-    function handleFrame(frame: ParsedV3Frame) {
-      const state = getOrCreateDecoder(frame.serial);
+    function closeDecoderState(state: DecoderState) {
+      if (state.pendingFrame) { state.pendingFrame.close(); state.pendingFrame = null; }
+      if (state.decoder.state !== 'closed') {
+        try { state.decoder.close(); } catch { /* noop */ }
+      }
+    }
 
-      if (frame.packetType === 0) {
-        const { sps, pps } = extractSPSPPS(frame.nalData);
-        if (sps.length === 0) return;
-        const codecString = parseSPSCodecString(sps[0]);
+    function resetDecoder(serial: string) {
+      const state = decoders.get(serial);
+      if (!state) return;
+      closeDecoderState(state);
+      decoders.delete(serial);
+    }
+
+    function configureDecoder(
+      state: DecoderState,
+      frame: ParsedV3Frame,
+      sps: Uint8Array[],
+      pps: Uint8Array[],
+    ): boolean {
+      const codecString = parseSPSCodecString(sps[0]);
+      const description = buildAvcC(sps, pps);
+      const modes: NonNullable<VideoDecoderConfig['hardwareAcceleration']>[] = [
+        'prefer-hardware',
+        'no-preference',
+        'prefer-software',
+      ];
+
+      for (const hardwareAcceleration of modes) {
         try {
-          const description = buildAvcC(sps, pps);
           const config: VideoDecoderConfig = {
             codec: codecString,
             codedWidth: frame.width,
             codedHeight: frame.height,
             description,
-            hardwareAcceleration: 'prefer-hardware',
+            hardwareAcceleration,
           };
           state.decoder.configure(config);
           state.configured = true;
           state.lastConfig = config;
           state.waitingForKeyframe = false;
+          return true;
+        } catch (e) {
+          console.warn(
+            `[WebCodecs] configure failed serial=${frame.serial} acceleration=${hardwareAcceleration}:`,
+            e,
+          );
+        }
+      }
+      return false;
+    }
+
+    function handleFrame(frame: ParsedV3Frame) {
+      let state = getOrCreateDecoder(frame.serial);
+      if (frame.seq !== null) {
+        const expected = state.lastSeq === null ? null : state.lastSeq + 1n;
+        const hasGap = expected !== null && frame.seq !== expected;
+        state.lastSeq = frame.seq;
+        if (hasGap && frame.packetType === 2) {
+          resetDecoder(frame.serial);
+          return;
+        }
+        if (hasGap && frame.packetType === 1) {
+          resetDecoder(frame.serial);
+          state = getOrCreateDecoder(frame.serial);
+          state.lastSeq = frame.seq;
+        }
+      }
+
+      if (frame.packetType === 0) {
+        const { sps, pps } = extractSPSPPS(frame.nalData);
+        if (sps.length === 0) return;
+        try {
+          configureDecoder(state, frame, sps, pps);
         } catch (e) {
           console.error(`[WebCodecs] configure failed serial=${frame.serial}:`, e);
+          resetDecoder(frame.serial);
         }
         return;
       }
 
-      // Keyframe self-configure for late subscribers
       if (frame.packetType === 1 && !state.configured) {
         const { sps, pps } = extractSPSPPS(frame.nalData);
         if (sps.length > 0) {
-          const codecString = parseSPSCodecString(sps[0]);
           try {
-            const description = buildAvcC(sps, pps);
-            const config: VideoDecoderConfig = {
-              codec: codecString,
-              codedWidth: frame.width,
-              codedHeight: frame.height,
-              description,
-              hardwareAcceleration: 'prefer-hardware',
-            };
-            state.decoder.configure(config);
-            state.configured = true;
-            state.lastConfig = config;
-          } catch { /* noop */ }
+            configureDecoder(state, frame, sps, pps);
+          } catch {
+            resetDecoder(frame.serial);
+          }
         }
       }
 
       if (!state.configured) return;
 
-      // After reset, skip until keyframe
       if (state.waitingForKeyframe) {
         if (frame.packetType !== 1) return;
         state.waitingForKeyframe = false;
       }
 
-      // Backpressure: if decode queue is building up, skip delta frames.
-      // Keyframes always go through — they let the decoder catch up cleanly.
       const queueSize = state.decoder.decodeQueueSize;
-      if (frame.packetType === 2 && queueSize > 3) {
+      if (frame.packetType === 2 && queueSize > 2) {
         state.waitingForKeyframe = true;
         return;
       }
@@ -228,46 +319,67 @@ export function useStream() {
         state.decoder.decode(chunk);
       } catch (e) {
         console.error(`[WebCodecs] decode error serial=${frame.serial}:`, e);
+        resetDecoder(frame.serial);
       }
     }
 
-    function cleanupDecoders(reason?: string) {
-      for (const [serial, state] of decoders) {
-        if (state.pendingFrame) { state.pendingFrame.close(); state.pendingFrame = null; }
-        if (state.decoder.state !== 'closed') {
-          try { state.decoder.close(); } catch { /* noop */ }
-        }
-        clearStreamFrame(serial);
-        if (reason) {
-          setStreamStatus(serial, 'disconnected', reason);
-        }
+    function closeSocket(serial: string) {
+      const state = socketsRef.current.get(serial);
+      if (!state) return;
+      state.closed = true;
+      if (state.reconnectTimer) {
+        clearTimeout(state.reconnectTimer);
+        state.reconnectTimer = null;
       }
-      decoders.clear();
+      const ws = state.ws;
+      state.ws = null;
+      socketsRef.current.delete(serial);
+      if (ws) {
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onclose = null;
+        ws.onerror = null;
+        try { ws.close(); } catch { /* noop */ }
+      }
     }
 
-    function connect() {
-      if (cancelled) return;
+    function connectSerial(serial: string) {
+      if (cancelled || socketsRef.current.has(serial)) return;
+      const state: SocketState = {
+        serial,
+        ws: null,
+        attempt: 0,
+        reconnectTimer: null,
+        closed: false,
+      };
+      socketsRef.current.set(serial, state);
+      openSocket(state);
+    }
+
+    function openSocket(state: SocketState) {
+      if (cancelled || state.closed || !desiredRef.current.has(state.serial)) return;
       let ws: WebSocket;
       try {
         ws = new WebSocket(WS_URL);
       } catch {
-        scheduleReconnect();
+        scheduleReconnect(state);
         return;
       }
       ws.binaryType = 'arraybuffer';
-      wsRef.current = ws;
+      state.ws = ws;
 
       ws.onopen = () => {
-        attempt = 0;
-        subscribedRef.current = new Set();
-        reconcile(ws, subscribedRef.current, desiredRef.current);
+        state.attempt = 0;
+        if (ws.readyState === WebSocket.OPEN && desiredRef.current.has(state.serial)) {
+          ws.send(JSON.stringify({ type: 'subscribe', serial: state.serial }));
+        }
       };
 
       ws.onmessage = (ev) => {
         if (!(ev.data instanceof ArrayBuffer)) return;
         try {
           const frame = parseV3Frame(ev.data);
-          if (!desiredRef.current.has(frame.serial)) return;
+          if (frame.serial !== state.serial || !desiredRef.current.has(frame.serial)) return;
           handleFrame(frame);
         } catch {
           // ignore malformed frames
@@ -275,39 +387,53 @@ export function useStream() {
       };
 
       ws.onclose = () => {
-        if (wsRef.current === ws) wsRef.current = null;
-        subscribedRef.current = new Set();
-        cleanupDecoders('local video socket disconnected');
-        scheduleReconnect();
+        if (state.ws === ws) state.ws = null;
+        const decoderState = decoders.get(state.serial);
+        if (decoderState) {
+          closeDecoderState(decoderState);
+          decoders.delete(state.serial);
+        }
+        setStreamStatus(state.serial, 'reconnecting', 'local video socket disconnected');
+        scheduleReconnect(state);
       };
 
       ws.onerror = () => {};
     }
 
-    function scheduleReconnect() {
-      if (cancelled) return;
-      attempt += 1;
+    function scheduleReconnect(state: SocketState) {
+      if (cancelled || state.closed || !desiredRef.current.has(state.serial)) return;
+      state.attempt += 1;
       const delay = Math.min(
         MAX_RECONNECT_DELAY_MS,
-        BASE_RECONNECT_DELAY_MS * Math.pow(2, attempt - 1),
+        BASE_RECONNECT_DELAY_MS * Math.pow(2, state.attempt - 1),
       );
-      reconnectTimer = setTimeout(connect, delay);
+      state.reconnectTimer = setTimeout(() => {
+        state.reconnectTimer = null;
+        openSocket(state);
+      }, delay);
     }
 
-    connect();
+    function cleanupDecoders() {
+      for (const [serial, state] of decoders) {
+        closeDecoderState(state);
+        clearStreamFrame(serial);
+      }
+      decoders.clear();
+    }
+
+    connectSerialRef.current = connectSerial;
+    closeSerialRef.current = closeSocket;
+    for (const serial of desiredRef.current) {
+      connectSerial(serial);
+    }
 
     return () => {
       cancelled = true;
+      connectSerialRef.current = null;
+      closeSerialRef.current = null;
       if (rafId !== null) cancelAnimationFrame(rafId);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      const ws = wsRef.current;
-      wsRef.current = null;
-      if (ws) {
-        ws.onopen = null;
-        ws.onmessage = null;
-        ws.onclose = null;
-        ws.onerror = null;
-        try { ws.close(); } catch { /* noop */ }
+      for (const serial of Array.from(socketsRef.current.keys())) {
+        closeSocket(serial);
       }
       cleanupDecoders();
     };
@@ -318,18 +444,52 @@ export function reconcile(
   ws: WebSocket | null,
   subscribed: Set<string>,
   desired: Set<string>,
+  options?: {
+    subscribeBatchSize?: number;
+    subscribeBatchGapMs?: number;
+    timers?: ReturnType<typeof setTimeout>[];
+    getDesired?: () => Set<string>;
+  },
 ): void {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  for (const s of desired) {
-    if (!subscribed.has(s)) {
-      ws.send(JSON.stringify({ type: 'subscribe', serial: s }));
-      subscribed.add(s);
-    }
-  }
   for (const s of Array.from(subscribed)) {
     if (!desired.has(s)) {
       ws.send(JSON.stringify({ type: 'unsubscribe', serial: s }));
       subscribed.delete(s);
+    }
+  }
+
+  const toSubscribe = Array.from(desired).filter((s) => !subscribed.has(s));
+  const batchSize = options?.subscribeBatchSize ?? toSubscribe.length;
+  const batchGapMs = options?.subscribeBatchGapMs ?? 0;
+  const timers = options?.timers;
+
+  for (const [index, s] of toSubscribe.entries()) {
+    subscribed.add(s);
+    const sendSubscribe = () => {
+      const stillDesired = options?.getDesired?.().has(s) ?? desired.has(s);
+      if (!stillDesired) {
+        subscribed.delete(s);
+        return;
+      }
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'subscribe', serial: s }));
+      } else {
+        subscribed.delete(s);
+      }
+    };
+
+    if (!timers || batchGapMs <= 0 || batchSize <= 0) {
+      sendSubscribe();
+      continue;
+    }
+
+    const batch = Math.floor(index / batchSize);
+    const delay = batch * batchGapMs;
+    if (delay <= 0) {
+      sendSubscribe();
+    } else {
+      timers.push(setTimeout(sendSubscribe, delay));
     }
   }
 }

@@ -24,6 +24,31 @@ function makeV3Frame(
   return buf;
 }
 
+function makeV4Frame(
+  serial: string,
+  packetType: number,
+  seq: bigint,
+  pts: bigint,
+  width: number,
+  height: number,
+  nalData: Uint8Array,
+): ArrayBuffer {
+  const serialBytes = new TextEncoder().encode(serial);
+  const buf = new ArrayBuffer(1 + 2 + serialBytes.length + 1 + 8 + 8 + 4 + 4 + nalData.length);
+  const view = new DataView(buf);
+  let off = 0;
+  view.setUint8(off, 4); off += 1;
+  view.setUint16(off, serialBytes.length, false); off += 2;
+  new Uint8Array(buf, off, serialBytes.length).set(serialBytes); off += serialBytes.length;
+  view.setUint8(off, packetType); off += 1;
+  view.setBigUint64(off, seq, false); off += 8;
+  view.setBigUint64(off, pts, false); off += 8;
+  view.setUint32(off, width, false); off += 4;
+  view.setUint32(off, height, false); off += 4;
+  new Uint8Array(buf, off, nalData.length).set(nalData);
+  return buf;
+}
+
 describe('parseV3Frame', () => {
   it('parses a valid v3 config frame', () => {
     const nal = new Uint8Array([0x00, 0x00, 0x00, 0x01, 0x67]);
@@ -31,6 +56,7 @@ describe('parseV3Frame', () => {
     const out = parseV3Frame(frame);
     expect(out.serial).toBe('abc');
     expect(out.packetType).toBe(0);
+    expect(out.seq).toBeNull();
     expect(out.pts).toBe(0n);
     expect(out.width).toBe(720);
     expect(out.height).toBe(1280);
@@ -46,6 +72,17 @@ describe('parseV3Frame', () => {
     expect(out.pts).toBe(12345n);
     expect(out.width).toBe(1080);
     expect(out.height).toBe(1920);
+  });
+
+  it('parses a v4 frame sequence number', () => {
+    const nal = new Uint8Array([0x00, 0x00, 0x01, 0x65]);
+    const frame = makeV4Frame('dev1', 1, 42n, 12345n, 1080, 1920, nal);
+    const out = parseV3Frame(frame);
+    expect(out.serial).toBe('dev1');
+    expect(out.packetType).toBe(1);
+    expect(out.seq).toBe(42n);
+    expect(out.pts).toBe(12345n);
+    expect(out.nalData).toEqual(nal);
   });
 
   it('handles multi-byte utf-8 serials', () => {

@@ -19,6 +19,7 @@ export function ServerList() {
       setServers([...servers, srv]);
       setHost('');
       setError('');
+      invoke('refresh_devices').catch(() => {});
     } catch (e: any) {
       setError(String(e));
     }
