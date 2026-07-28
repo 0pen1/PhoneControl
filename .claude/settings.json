@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(npm test)",
+      "Bash(npm run test:watch)",
+      "Bash(npm run build)",
+      "Bash(npm run tauri:*)",
+      "Bash(npm install)",
+      "Bash(npm ci)",
+      "Bash(cargo check:*)",
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(adb devices:*)",
+      "Bash(adb -s emulator-5554 shell:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(rg:*)",
+      "Read(//Users/plaud/Library/Android/sdk/**)",
+      "Read(//opt/homebrew/Cellar/scrcpy/**)"
+    ]
+  }
+}
